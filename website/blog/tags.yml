@@ -1,0 +1,48 @@
+news:
+  label: News
+  permalink: /news
+  description: Releases, announcements and what changed for people running Mercury.
+engineering:
+  label: Engineering
+  permalink: /engineering
+  description: How Mercury is built, what broke, and what we changed so it does not break again.
+product:
+  label: Product
+  permalink: /product
+  description: How Mercury's features work and why they work that way.
+releases:
+  label: Releases
+  permalink: /releases
+  description: Notes on each Mercury release.
+security:
+  label: Security
+  permalink: /security
+  description: Permissions, sandboxing and how Mercury keeps an agent with real tools safe to run.
+postmortem:
+  label: Postmortem
+  permalink: /postmortem
+  description: Incidents and bugs, written up honestly.
+runtime:
+  label: Runtime
+  permalink: /runtime
+  description: The daemon, the attach client and everything that keeps Mercury running.
+cloud:
+  label: Mercury Cloud
+  permalink: /cloud
+  description: News and notes about Mercury Cloud.
+ai-agents:
+  label: AI Agents
+  permalink: /ai-agents
+  description: Comparisons and notes on AI agents that run tasks for you.
+ai-agent-comparison:
+  label: AI Agent Comparison
+  permalink: /ai-agent-comparison
+  description: Side-by-side comparisons of AI agent products on memory, permissions, scheduling and price.
+self-hosted-ai:
+  label: Self-Hosted AI
+  permalink: /self-hosted-ai
+  description: Running AI agents on your own machine or server.
+ai-agent-memory:
+  label: AI Agent Memory
+  permalink: /ai-agent-memory
+  description: How AI agents store, show and correct what they remember.

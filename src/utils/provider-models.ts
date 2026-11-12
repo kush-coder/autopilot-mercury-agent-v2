@@ -1,0 +1,696 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { ProviderConfig, ProviderName } from './config.js';
+import { fetchChatGPTModels } from '../auth/chatgpt-models.js';
+import { fetchGitHubModels } from '../auth/github-models.js';
+import { MERCURY_CLOUD_API_URL } from '../cloud/endpoints.js';
+import { basicAuthHeaders } from '../providers/basic-auth.js';
+
+export interface ProviderModelCatalog {
+  models: string[];
+  recommendedModel: string;
+}
+
+const MAX_MODEL_OPTIONS = 50;
+
+// Verified present in the AI/ML API catalogue on 2026-09-10. The ids are
+// namespaced by lab there, so they do not collide with the bare ids other
+// providers in this file use.
+const AIMLAPI_PREFERRED_MODELS = [
+  'anthropic/claude-sonnet-4.6',
+  'openai/gpt-5.2-chat-latest',
+  'deepseek/deepseek-chat',
+  'openai/gpt-4o-mini',
+] as const;
+
+const OPENAI_PREFERRED_MODELS = [
+  'gpt-5.2',
+  'gpt-5.2-chat-latest',
+  'gpt-5.2-pro',
+  'gpt-5-mini',
+  'gpt-5-nano',
+  'gpt-4.1',
+  'gpt-4.1-mini',
+  'gpt-oss-120b',
+  'gpt-oss-20b',
+] as const;
+
+const ANTHROPIC_PREFERRED_MODELS = [
+  'claude-sonnet-4-20250514',
+  'claude-opus-4-20250514',
+  'claude-3-7-sonnet-latest',
+  'claude-3-5-sonnet-latest',
+  'claude-3-5-haiku-latest',
+] as const;
+
+const DEEPSEEK_PREFERRED_MODELS = [
+  'deepseek-chat',
+  'deepseek-reasoner',
+] as const;
+
+const GROK_PREFERRED_MODELS = [
+  'grok-4',
+  'grok-4-latest',
+  'grok-4.20',
+  'grok-3',
+  'grok-3-latest',
+] as const;
+
+const ATLASCLOUD_PREFERRED_MODELS = [
+  'qwen/qwen3.5-flash',
+  'deepseek-ai/deepseek-v4-pro',
+] as const;
+
+const RUNCRATE_PREFERRED_MODELS = [
+  'deepseek-ai/DeepSeek-V4.1-Flash',
+  'zai-org/GLM-5.3-Flash',
+  'zai-org/GLM-5.3',
+  'Qwen/Qwen3.8-Flash',
+  'moonshotai/Kimi-K2.6',
+] as const;
+
+// Verified present on GET https://cloudgpu.app/v1/models on 2026-11-01.
+// CloudGPU is an OpenAI-compatible model API gateway.
+const CLOUDGPU_PREFERRED_MODELS = [
+  'deepseek-v4.1-flash',
+  'deepseek-v4-pro',
+  'kimi-k3',
+  'kimi-k2.7-code',
+  'glm-5.2',
+  'minimax-m3',
+  'qwen3-coder-480b',
+  'qwen3.5-397b',
+] as const;
+
+const OLLAMA_CLOUD_PREFERRED_MODELS = [
+  'gpt-oss:120b',
+  'gpt-oss:120b-cloud',
+  'gpt-oss:20b',
+] as const;
+
+const OLLAMA_LOCAL_PREFERRED_MODELS = [
+  'llama3.2',
+  'llama3.1',
+  'llama3',
+  'mistral',
+  'codellama',
+  'gemma2',
+  'phi3',
+  'qwen2',
+  'deepseek-r1',
+  'deepseek-coder-v2',
+] as const;
+
+const MIMO_PREFERRED_MODELS = [
+  'mimo-v2.5-pro',
+  'mimo-v2.5',
+  'mimo-v2-pro',
+  'mimo-v2-omni',
+  'mimo-v2-flash',
+] as const;
+
+const MIMO_TOKEN_PLAN_PREFERRED_MODELS = MIMO_PREFERRED_MODELS;
+
+const OPENAI_COMPAT_PREFERRED_MODELS = [] as const;
+const LM_STUDIO_PREFERRED_MODELS = [] as const;
+const ATOMIC_CHAT_PREFERRED_MODELS = [] as const;
+
+const CHATGPT_WEB_PREFERRED_MODELS = [
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.5',
+  'gpt-6-astra',
+  'gpt-5.6-luna',
+] as const;
+
+const GITHUB_COPILOT_PREFERRED_MODELS = [
+  'claude-sonnet-4.6',
+  'gpt-4o',
+  'gpt-5.4',
+  'claude-opus-4.6',
+  'claude-opus-4.7',
+  'gpt-4.1',
+  'gpt-4o-mini',
+  'gemini-3.1-pro-preview',
+] as const;
+
+const MERCURY_CLOUD_PREFERRED_MODELS = [
+  'mercury-mini',
+  'mercury-flash',
+  'mercury-pro',
+  'mercury-reason',
+  'mercury-opus',
+  'mercury-gpt5',
+] as const;
+
+export class ProviderModelFetchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderModelFetchError';
+  }
+}
+
+export function getPreferredModelsForProvider(provider: ProviderName): string[] {
+  const preferredByProvider: Record<ProviderName, readonly string[]> = {
+    mercuryCloud: MERCURY_CLOUD_PREFERRED_MODELS,
+    aimlapi: AIMLAPI_PREFERRED_MODELS,
+    deepseek: DEEPSEEK_PREFERRED_MODELS,
+    openai: OPENAI_PREFERRED_MODELS,
+    anthropic: ANTHROPIC_PREFERRED_MODELS,
+    grok: GROK_PREFERRED_MODELS,
+    atlascloud: ATLASCLOUD_PREFERRED_MODELS,
+    runcrate: RUNCRATE_PREFERRED_MODELS,
+    cloudgpu: CLOUDGPU_PREFERRED_MODELS,
+    ollamaCloud: OLLAMA_CLOUD_PREFERRED_MODELS,
+    ollamaLocal: OLLAMA_LOCAL_PREFERRED_MODELS,
+    atomicChat: ATOMIC_CHAT_PREFERRED_MODELS,
+    openaiCompat: OPENAI_COMPAT_PREFERRED_MODELS,
+    litellm: OPENAI_COMPAT_PREFERRED_MODELS,
+    lmStudio: LM_STUDIO_PREFERRED_MODELS,
+    mimo: MIMO_PREFERRED_MODELS,
+    mimoTokenPlan: MIMO_TOKEN_PLAN_PREFERRED_MODELS,
+    chatgptWeb: CHATGPT_WEB_PREFERRED_MODELS,
+    githubCopilot: GITHUB_COPILOT_PREFERRED_MODELS,
+  };
+
+  return [...preferredByProvider[provider]];
+}
+
+interface OpenAIModelResponse {
+  data?: Array<{ id?: string; output_modalities?: string[]; type?: string }>;
+}
+
+/**
+ * AI/ML API lists every surface it serves — chat, images, video, speech,
+ * batches — as separate rows, and the same model id appears once per surface.
+ * `type` names the surface, so the chat set is the rows that carry the
+ * OpenAI-compatible one; `uniq` in `buildModelCatalog` collapses the repeats.
+ *
+ * Filtering by id text the way `isOpenAIChatModel` does cannot work here: ids
+ * are namespaced by lab (`anthropic/claude-sonnet-4.6`, `deepseek/...`), so a
+ * `gpt-`/`o<digit>` rule discards all 353 chat models and the catalogue comes
+ * back empty.
+ */
+const AIMLAPI_CHAT_SURFACE = 'openai/chat-completions';
+
+interface AnthropicModelResponse {
+  data?: Array<{ id?: string }>;
+}
+
+interface XAIModelResponse {
+  models?: unknown;
+  data?: unknown;
+}
+
+interface OllamaTagsResponse {
+  models?: Array<{ name?: string; model?: string }>;
+}
+
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, '');
+}
+
+async function fetchJson<T>(url: string, init: RequestInit, invalidMessage: string): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    throw new ProviderModelFetchError(invalidMessage);
+  }
+
+  if (!response.ok) {
+    throw new ProviderModelFetchError(invalidMessage);
+  }
+
+  try {
+    return await response.json() as T;
+  } catch {
+    throw new ProviderModelFetchError('Mercury could not read the model list returned by this provider.');
+  }
+}
+
+function uniq(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function prioritizeModels(models: string[], preferred: readonly string[]): string[] {
+  const preferredSet = new Set(preferred);
+  const preferredMatches = preferred.filter((model) => models.includes(model));
+  const others = models
+    .filter((model) => !preferredSet.has(model))
+    .sort((a, b) => a.localeCompare(b));
+
+  return [...preferredMatches, ...others];
+}
+
+/** Per-call cap: the CLI picker shows 50; the desktop Settings asks for every model. */
+const modelLimit = new AsyncLocalStorage<number>();
+
+function limitModels(models: string[]): string[] {
+  return models.slice(0, modelLimit.getStore() ?? MAX_MODEL_OPTIONS);
+}
+
+function isOpenAIChatModel(id: string): boolean {
+  const lower = id.toLowerCase();
+  if (
+    lower.includes('image')
+    || lower.includes('audio')
+    || lower.includes('tts')
+    || lower.includes('transcribe')
+    || lower.includes('embedding')
+    || lower.includes('moderation')
+    || lower.includes('realtime')
+    || lower.includes('whisper')
+    || lower.includes('search')
+    || lower.includes('computer')
+  ) {
+    return false;
+  }
+
+  return lower.startsWith('gpt-') || /^o\d/.test(lower);
+}
+
+function chooseRecommendedModel(
+  provider: ProviderName,
+  models: string[],
+  currentModel?: string,
+): string {
+  const preferredByProvider: Record<ProviderName, readonly string[]> = {
+    mercuryCloud: MERCURY_CLOUD_PREFERRED_MODELS,
+    aimlapi: AIMLAPI_PREFERRED_MODELS,
+    deepseek: DEEPSEEK_PREFERRED_MODELS,
+    openai: OPENAI_PREFERRED_MODELS,
+    anthropic: ANTHROPIC_PREFERRED_MODELS,
+    grok: GROK_PREFERRED_MODELS,
+    atlascloud: ATLASCLOUD_PREFERRED_MODELS,
+    runcrate: RUNCRATE_PREFERRED_MODELS,
+    cloudgpu: CLOUDGPU_PREFERRED_MODELS,
+    ollamaCloud: OLLAMA_CLOUD_PREFERRED_MODELS,
+    ollamaLocal: OLLAMA_LOCAL_PREFERRED_MODELS,
+    atomicChat: ATOMIC_CHAT_PREFERRED_MODELS,
+    openaiCompat: OPENAI_COMPAT_PREFERRED_MODELS,
+    mimo: MIMO_PREFERRED_MODELS,
+    mimoTokenPlan: MIMO_TOKEN_PLAN_PREFERRED_MODELS,
+    chatgptWeb: CHATGPT_WEB_PREFERRED_MODELS,
+    lmStudio: LM_STUDIO_PREFERRED_MODELS,
+    githubCopilot: GITHUB_COPILOT_PREFERRED_MODELS,
+    litellm: OPENAI_COMPAT_PREFERRED_MODELS,
+  };
+
+  for (const candidate of preferredByProvider[provider]) {
+    if (models.includes(candidate)) {
+      return candidate;
+    }
+  }
+
+  if (currentModel && models.includes(currentModel)) {
+    return currentModel;
+  }
+
+  return models[0];
+}
+
+/** Models that can't hold a conversation (rerankers, embedders, speech, images, moderation). */
+const NON_CHAT = /(^|[-_/.:])(rerank(er)?|embed(ding)?s?|whisper|tts|transcribe|moderation|dall-e|image-gen|text-to-speech|speech)([-_/.:]|$)/i;
+export function isChatModelId(id: string): boolean {
+  return !NON_CHAT.test(id);
+}
+
+export function buildModelCatalog(
+  provider: ProviderName,
+  models: string[],
+  currentModel?: string,
+): ProviderModelCatalog {
+  const filtered = uniq(models).filter(isChatModelId);
+  if (filtered.length === 0) {
+    throw new ProviderModelFetchError('Mercury could not find any supported chat models for this provider.');
+  }
+
+  const recommendedModel = chooseRecommendedModel(provider, filtered, currentModel);
+  const preferredByProvider: Record<ProviderName, readonly string[]> = {
+    mercuryCloud: MERCURY_CLOUD_PREFERRED_MODELS,
+    aimlapi: AIMLAPI_PREFERRED_MODELS,
+    deepseek: DEEPSEEK_PREFERRED_MODELS,
+    openai: OPENAI_PREFERRED_MODELS,
+    anthropic: ANTHROPIC_PREFERRED_MODELS,
+    grok: GROK_PREFERRED_MODELS,
+    atlascloud: ATLASCLOUD_PREFERRED_MODELS,
+    runcrate: RUNCRATE_PREFERRED_MODELS,
+    cloudgpu: CLOUDGPU_PREFERRED_MODELS,
+    ollamaCloud: OLLAMA_CLOUD_PREFERRED_MODELS,
+    ollamaLocal: OLLAMA_LOCAL_PREFERRED_MODELS,
+    atomicChat: ATOMIC_CHAT_PREFERRED_MODELS,
+    openaiCompat: OPENAI_COMPAT_PREFERRED_MODELS,
+    mimo: MIMO_PREFERRED_MODELS,
+    mimoTokenPlan: MIMO_TOKEN_PLAN_PREFERRED_MODELS,
+    chatgptWeb: CHATGPT_WEB_PREFERRED_MODELS,
+    githubCopilot: GITHUB_COPILOT_PREFERRED_MODELS,
+    litellm: OPENAI_COMPAT_PREFERRED_MODELS,
+    lmStudio: LM_STUDIO_PREFERRED_MODELS,
+  };
+
+  const withoutRecommended = filtered.filter((model) => model !== recommendedModel);
+  const prioritized = prioritizeModels(withoutRecommended, preferredByProvider[provider]);
+
+  return {
+    recommendedModel,
+    models: limitModels(prioritized),
+  };
+}
+
+async function fetchOpenAICompatModels(provider: ProviderName, config: ProviderConfig): Promise<ProviderModelCatalog> {
+  const headers: Record<string, string> = {};
+  if (config.apiKey) {
+    headers['Authorization'] = `Bearer ${config.apiKey}`;
+  }
+  Object.assign(headers, basicAuthHeaders(config));
+
+  let errorMessage: string;
+  if (provider === 'grok') {
+    errorMessage = 'Mercury could not fetch models for this Grok key. Please re-enter it.';
+  } else if (provider === 'atlascloud') {
+    errorMessage = 'Mercury could not fetch models for this Atlas Cloud key. Please re-enter it.';
+  } else if (provider === 'runcrate') {
+    errorMessage = 'Mercury could not fetch models for this Runcrate key. Please re-enter it.';
+  } else if (provider === 'cloudgpu') {
+    errorMessage = 'Mercury could not fetch models for this CloudGPU key. Please re-enter it.';
+  } else if (provider === 'deepseek') {
+    errorMessage = 'Mercury could not fetch models for this DeepSeek key. Please re-enter it.';
+  } else if (provider === 'aimlapi') {
+    errorMessage = 'Mercury could not fetch models for this AI/ML API key. Please re-enter it.';
+  } else if (provider === 'openaiCompat' || provider === 'atomicChat' || provider === 'lmStudio') {
+    errorMessage = 'Mercury could not fetch models from this server. Please check the base URL and try again.';
+  } else if (provider === 'litellm') {
+    errorMessage = 'Mercury could not fetch models from the LiteLLM proxy. Please check the base URL and ensure the proxy is running.';
+  } else {
+    errorMessage = 'Mercury could not fetch models for this OpenAI key. Please re-enter it.';
+  }
+
+  const data = await fetchJson<OpenAIModelResponse>(
+    `${trimTrailingSlash(config.baseUrl)}/models`,
+    { headers },
+    errorMessage,
+  );
+
+  const ids = (data.data ?? [])
+    .map((model) => ({
+      id: model.id?.trim() ?? '',
+      outputModalities: model.output_modalities,
+      surface: model.type,
+    }))
+    .filter(({ id, outputModalities, surface }) => {
+      if (provider === 'aimlapi') {
+        return id.length > 0 && surface === AIMLAPI_CHAT_SURFACE;
+      }
+      if (provider === 'deepseek') {
+        return id.startsWith('deepseek-');
+      }
+      if (provider === 'openaiCompat' || provider === 'litellm' || provider === 'atomicChat' || provider === 'lmStudio') {
+        return id.length > 0;
+      }
+      if (provider === 'atlascloud') {
+        const lower = id.toLowerCase();
+        return id.length > 0
+          && (outputModalities == null || outputModalities.includes('text'))
+          && !lower.includes('embedding')
+          && !lower.includes('image')
+          && !lower.includes('video')
+          && !lower.includes('audio')
+          && !lower.includes('tts')
+          && !lower.includes('whisper');
+      }
+      if (provider === 'runcrate') {
+        // Runcrate lists image, video, audio and embedding models on the same
+        // endpoint; each row says what it outputs.
+        return id.length > 0 && (outputModalities ?? []).includes('text');
+      }
+      if (provider === 'cloudgpu') {
+        // CloudGPU lists image, speech and transcription models on the same
+        // endpoint. Rows do not declare an output modality, so those are dropped by id.
+        const lower = id.toLowerCase();
+        return id.length > 0
+          && !lower.startsWith('flux')
+          && !lower.includes('tts')
+          && !lower.includes('whisper')
+          && !lower.endsWith('-asr')
+          && !lower.includes('transcri');
+      }
+      return isOpenAIChatModel(id);
+    })
+    .map(({ id }) => id);
+
+  return buildModelCatalog(provider, ids, config.model);
+}
+
+async function fetchAnthropicModels(config: ProviderConfig): Promise<ProviderModelCatalog> {
+  const data = await fetchJson<AnthropicModelResponse>(
+    'https://api.anthropic.com/v1/models',
+    {
+      headers: {
+        'x-api-key': config.apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+    },
+    'Mercury could not fetch models for this Anthropic key. Please re-enter it.',
+  );
+
+  const ids = (data.data ?? [])
+    .map((model) => model.id?.trim() ?? '')
+    .filter((id) => id.startsWith('claude-'));
+
+  return buildModelCatalog('anthropic', ids, config.model);
+}
+
+async function fetchGrokModels(config: ProviderConfig): Promise<ProviderModelCatalog> {
+  const data = await fetchJson<XAIModelResponse | null>(
+    `${trimTrailingSlash(config.baseUrl)}/language-models`,
+    {
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+    },
+    'Mercury could not fetch models for this Grok key. Please re-enter it.',
+  );
+
+  // /language-models uses `models`; retain the older OpenAI-shaped envelopes.
+  const legacyData = data?.data;
+  const models: unknown[] = Array.isArray(data?.models) ? data.models
+    : Array.isArray(legacyData) ? legacyData
+      : legacyData && typeof legacyData === 'object' && 'data' in legacyData && Array.isArray(legacyData.data)
+        ? legacyData.data : [];
+  const ids = models.flatMap((model) => {
+    if (!model || typeof model !== 'object') return [];
+    const { id, aliases, output_modalities: outputModalities } = model as Record<string, unknown>;
+    if (outputModalities != null && (!Array.isArray(outputModalities) || !outputModalities.includes('text'))) return [];
+    return [id, ...(Array.isArray(aliases) ? aliases : [])]
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => value.trim())
+      .filter((value) => value.startsWith('grok-'));
+  });
+
+  return buildModelCatalog('grok', ids, config.model);
+}
+
+async function fetchOllamaCloudModels(config: ProviderConfig): Promise<ProviderModelCatalog> {
+  const data = await fetchJson<OpenAIModelResponse>(
+    `${trimTrailingSlash(config.baseUrl)}/models`,
+    {
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+    },
+    'Mercury could not fetch models for this Ollama Cloud key. Please re-enter it.',
+  );
+
+  const ids = (data.data ?? [])
+    .map((model) => model.id?.trim() ?? '')
+    .filter(Boolean);
+
+  return buildModelCatalog('ollamaCloud', ids, config.model);
+}
+
+async function fetchLmStudioModels(config: ProviderConfig): Promise<ProviderModelCatalog> {
+  const data = await fetchJson<OpenAIModelResponse>(
+    `${trimTrailingSlash(config.baseUrl)}/models`,
+    { headers: basicAuthHeaders(config) },
+    'Mercury could not fetch models from LM Studio. Make sure LM Studio is running and the Developer API is enabled.',
+  );
+
+  const ids = (data.data ?? [])
+    .map((model) => model.id?.trim() ?? '')
+    .filter(Boolean);
+
+  return buildModelCatalog('lmStudio', ids, config.model);
+}
+
+async function fetchOllamaLocalModels(config: ProviderConfig): Promise<ProviderModelCatalog> {
+  const data = await fetchJson<OllamaTagsResponse>(
+    `${trimTrailingSlash(config.baseUrl)}/tags`,
+    { headers: basicAuthHeaders(config) },
+    'Mercury could not fetch models from this Ollama Local server. Please check the base URL and try again.',
+  );
+
+  const ids = (data.models ?? [])
+    .map((model) => model.model?.trim() || model.name?.trim() || '')
+    .filter(Boolean);
+
+  return buildModelCatalog('ollamaLocal', ids, config.model);
+}
+
+async function fetchMiMoModels(config: ProviderConfig): Promise<ProviderModelCatalog> {
+  const data = await fetchJson<OpenAIModelResponse>(
+    `${trimTrailingSlash(config.baseUrl)}/models`,
+    {
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+    },
+    'Mercury could not fetch models for this MiMo key. Please re-enter it.',
+  );
+
+  const ids = (data.data ?? [])
+    .map((model) => model.id?.trim() ?? '')
+    .filter((id) => {
+      const lower = id.toLowerCase();
+      return lower.startsWith('mimo-') && !lower.includes('tts');
+    });
+
+  return buildModelCatalog('mimo', ids, config.model);
+}
+
+async function fetchMiMoTokenPlanModels(config: ProviderConfig): Promise<ProviderModelCatalog> {
+  const data = await fetchJson<OpenAIModelResponse>(
+    `${trimTrailingSlash(config.baseUrl)}/models`,
+    {
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+    },
+    'Mercury could not fetch models for this MiMo Token Plan key. Please re-enter it.',
+  );
+
+  const ids = (data.data ?? [])
+    .map((model) => model.id?.trim() ?? '')
+    .filter((id) => {
+      const lower = id.toLowerCase();
+      return lower.startsWith('mimo-') && !lower.includes('tts');
+    });
+
+  return buildModelCatalog('mimoTokenPlan', ids, config.model);
+}
+
+async function fetchMercuryCloudModels(config: ProviderConfig): Promise<ProviderModelCatalog> {
+  const baseUrl = trimTrailingSlash(config.baseUrl || MERCURY_CLOUD_API_URL);
+  const jwt = config.apiKey;
+
+  if (!jwt) {
+    return buildModelCatalog(
+      'mercuryCloud',
+      [...MERCURY_CLOUD_PREFERRED_MODELS],
+      config.model || 'mercury-mini',
+    );
+  }
+
+  interface MercuryCloudModel {
+    id: string;
+    label: string;
+    available?: boolean;
+  }
+
+  const data = await fetchJson<{ object: string; data: MercuryCloudModel[] }>(
+    `${baseUrl}/v1/models`,
+    {
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+      },
+    },
+    'Could not fetch Mercury Cloud models. Check your cloud connection.',
+  );
+
+  // The Cloud /v1/models endpoint returns an OpenAI-shaped { object: 'list', data: [...] }
+  // payload with a per-model `available` flag computed from the user's subscription tier.
+  // Only surface models the user is approved for; fall back to the full list if the flag
+  // is missing (older API deployments) so the dropdown is never empty.
+  const allModels = Array.isArray(data.data) ? data.data : [];
+  const allowed = allModels.filter((m) => m.available === true).map((m) => m.id);
+  const ids = allowed.length > 0 ? allowed : allModels.map((m) => m.id);
+  const models = uniq(ids).filter(isChatModelId);
+  return {
+    recommendedModel: config.model && models.includes(config.model) ? config.model : models[0] || config.model || 'mercury-mini',
+    models: limitModels(models.filter((model) => model !== config.model)),
+  };
+}
+
+export async function fetchProviderModelCatalog(
+  provider: ProviderName,
+  config: ProviderConfig,
+  opts: { limit?: number } = {},
+): Promise<ProviderModelCatalog> {
+  if (opts.limit !== undefined) return modelLimit.run(Math.max(1, opts.limit), () => fetchCatalog(provider, config));
+  return fetchCatalog(provider, config);
+}
+
+async function fetchCatalog(provider: ProviderName, config: ProviderConfig): Promise<ProviderModelCatalog> {
+  if (provider === 'mercuryCloud') {
+    return fetchMercuryCloudModels(config);
+  }
+
+  if (provider === 'anthropic') {
+    return fetchAnthropicModels(config);
+  }
+
+  if (provider === 'grok') {
+    return fetchGrokModels(config);
+  }
+
+  if (provider === 'ollamaCloud') {
+    return fetchOllamaCloudModels(config);
+  }
+
+  if (provider === 'ollamaLocal') {
+    return fetchOllamaLocalModels(config);
+  }
+
+  if (provider === 'openaiCompat' || provider === 'litellm' || provider === 'atomicChat') {
+    return fetchOpenAICompatModels(provider, config);
+  }
+
+  if (provider === 'lmStudio') {
+    return fetchLmStudioModels(config);
+  }
+
+  if (provider === 'mimo') {
+    return fetchMiMoModels(config);
+  }
+
+  if (provider === 'mimoTokenPlan') {
+    return fetchMiMoTokenPlanModels(config);
+  }
+
+  if (provider === 'chatgptWeb') {
+    // chatgptWeb uses OAuth session token, not apiKey
+    const { getValidChatGPTSession } = await import('../auth/chatgpt-session.js');
+    const session = await getValidChatGPTSession();
+    if (!session?.accessToken || !session?.accountId) {
+      throw new ProviderModelFetchError(
+        'ChatGPT Web is not authenticated. Run `mercury doctor` to set up OAuth.',
+      );
+    }
+    return fetchChatGPTModels(session.accessToken, session.accountId);
+  }
+
+  if (provider === 'githubCopilot') {
+    const { loadGitHubSession } = await import('../auth/github-session.js');
+    const session = loadGitHubSession();
+    if (!session?.accessToken) {
+      throw new ProviderModelFetchError(
+        'GitHub Copilot is not authenticated. Run `mercury doctor` to set up OAuth.',
+      );
+    }
+    return fetchGitHubModels(session.accessToken);
+  }
+
+  return fetchOpenAICompatModels(provider, config);
+}

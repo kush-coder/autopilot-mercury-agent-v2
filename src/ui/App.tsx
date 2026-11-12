@@ -1,0 +1,2754 @@
+import React, { useSyncExternalStore } from 'react';
+import { Box, Text, Spacer, Static, useApp, useInput, useStdout } from 'ink';
+import type { TuiState } from '../channels/cli.js';
+import { TUI_FROZEN_HINT_MARKER } from '../channels/cli.js';
+import type { AppMode, ChatMessage, ToolStep, SubAgentInfo, PermissionPromptState, SidebarSection, BackgroundTaskInfo, WorkspaceState, LiveActivityState, PlanStep } from './types.js';
+import type { PermissionMode } from '../channels/base.js';
+import type { ProgrammingModeState } from '../core/programming-mode.js';
+import { renderMarkdown } from '../utils/markdown.js';
+import { IS_LIGHT_TERMINAL } from '../utils/terminal-theme.js';
+import { highlightCodeBlock } from '../utils/highlight.js';
+import { normalizeTerminalText, getViewportWindow } from './terminal-viewport.js';
+import { useTerminalSize as useSharedTerminalSize } from './use-terminal-size.js';
+import { CursorCell } from './cursor-anchor.js';
+import { isNarrow, ruleWidth, sidePanelWidth, fitTail, hintColumns } from './layout.js';
+import { fitSegments, statusSegments, type StatusSegment } from './status-bar.js';
+import { useTick, spinnerFrame, elapsedSeconds, SPINNER_FRAMES } from './tick-store.js';
+import { loadInputHistory, saveInputHistory } from './input-history-store.js';
+import { buildMercuryMessageLines, buildMercuryBrandLines, buildStreamTailLines, parseChunkIndex, splitFinalMessage, splitStreamingMessage, type MercuryTranscriptLine } from './mercury-transcript.js';
+import { GENERIC_PHASES, PLANNING_VERBS, lastUserText, pickStatusWord } from './status-word.js';
+import { nextTip, rotateTip } from './tips.js';
+import { LaunchPad } from './launch-pad.js';
+import { SLASH_COMMANDS, buildSlashSuggestions, buildSkillSuggestions, skillFillText, shouldSubmitSlash, pushHistoryLine, historyPrev, historyNext, createInputHistoryState, SuggestionList, applyEditKey, isPasteChunk, graphemeAt, nextGraphemeBoundary, expandTabs, ctrlCAction, CTRL_C_EXIT_HINT, CTRL_C_EXIT_WINDOW_MS, type EditorKey, type SkillEntry } from './input-composer.js';
+import { PLAYER_CONTROLS, formatNowPlaying } from '../spotify/ui.js';
+import type { SpotifyClient } from '../spotify/client.js';
+import type { SubAgentStatus } from '../types/agent.js';
+
+const BRAND = IS_LIGHT_TERMINAL
+  ? { logo: 'blue', title: 'blue', subtitle: 'gray', accent: 'magenta' }
+  : { logo: 'cyan', title: 'cyan', subtitle: 'gray', accent: 'magenta' };
+
+const STATUS_ICONS: Record<string, { icon: string; color: string }> = {
+  pending: { icon: '🔵', color: 'blue' },
+  running: { icon: '🟢', color: 'green' },
+  paused: { icon: '🟡', color: 'yellow' },
+  completed: { icon: '✅', color: 'green' },
+  failed: { icon: '❌', color: 'red' },
+  halted: { icon: '⛔', color: 'red' },
+};
+
+function canRenderInlineAlbumArt(): boolean {
+  if (process.env.MERCURY_SPOTIFY_ART !== '1') return false;
+  if (process.env.CI === 'true') return false;
+  if (process.env.SSH_CONNECTION || process.env.SSH_TTY) return false;
+  return process.env.TERM_PROGRAM === 'iTerm.app';
+}
+
+async function buildItermInlineImage(url: string): Promise<string> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Album art fetch failed: ${response.status}`);
+  const contentType = response.headers.get('content-type') || 'image/jpeg';
+  const data = Buffer.from(await response.arrayBuffer()).toString('base64');
+  return `\u001b]1337;File=inline=1;width=24;height=12;preserveAspectRatio=1;type=${contentType}:${data}\u0007`;
+}
+
+export interface TuiAppProps {
+  /** Live channel store: state is read via useSyncExternalStore, not props. */
+  channel: {
+    getTuiStateSnapshot: () => TuiState;
+    subscribeToTuiState: (listener: () => void) => () => void;
+  };
+  onInput: (text: string) => void;
+  onPermissionResolve: (value: string | boolean) => void;
+  onExit: () => void;
+  /** Esc during a running turn: interrupt it (the channel routes this to
+   * the same stop path `/stop` uses). Optional for test harnesses. */
+  onInterrupt?: () => void;
+  spotifyClient?: SpotifyClient | null;
+}
+
+export function TuiApp({ channel, onInput, onPermissionResolve, onExit, onInterrupt, spotifyClient }: TuiAppProps) {
+  // Single source of render truth: the channel's immutable state snapshots.
+  // Notifications are scheduled by React's reconciler — no imperative
+  // re-render path exists, so re-entrant commits are impossible.
+  const state = useSyncExternalStore(channel.subscribeToTuiState, channel.getTuiStateSnapshot, channel.getTuiStateSnapshot);
+  const { exit } = useApp();
+  const terminalSize = useTerminalSize();
+  const [input, setInput] = React.useState('');
+  const [cursorPos, setCursorPos] = React.useState(0);
+  const setInputAndCursor = (text: string, pos?: number) => {
+    setInput(text);
+    setCursorPos(pos ?? text.length);
+  };  const [permIdx, setPermIdx] = React.useState(0);
+  const permIdxRef = React.useRef(0);
+  const [menuIdx, setMenuIdx] = React.useState(0);
+  const [spotifyIdx, setSpotifyIdx] = React.useState(6);
+  const [showStartupDetails, setShowStartupDetails] = React.useState(false);
+  const [spotifyNow, setSpotifyNow] = React.useState('');
+  const [spotifyStatus, setSpotifyStatus] = React.useState('');
+  const [spotifyVolume, setSpotifyVolume] = React.useState<number | null>(null);
+  const [spotifyArtUrl, setSpotifyArtUrl] = React.useState<string | null>(null);
+  const [spotifyArtAnsi, setSpotifyArtAnsi] = React.useState<string>('');
+  const albumArtCache = React.useRef<Map<string, string>>(new Map());
+  // Shell-style input history — shared composer state (↑/↓ navigation with
+  // draft snapshotting; see input-composer.tsx).
+  // Seeded from ~/.mercury/history (last 500 lines) and persisted on every
+  // submission — see input-history-store.ts.
+  const [inputHistory, setInputHistory] = React.useState(() => createInputHistoryState(loadInputHistory()));
+  const recordHistory = React.useCallback((line: string) => {
+    setInputHistory((prev) => {
+      const next = pushHistoryLine(prev, line);
+      if (next !== prev) saveInputHistory(next.history);
+      return next;
+    });
+  }, []);
+  const [gitCursor, setGitCursor] = React.useState(0);
+  // Ctrl+C: clear the input when it has text; on an empty input the first
+  // tap arms a 1.5 s window and shows a hint, the second tap exits. A single
+  // tap never exits (and never process.exit()s) — see ctrlCAction().
+  const ctrlCArmedAtRef = React.useRef<number | null>(null);
+  const [ctrlCHint, setCtrlCHint] = React.useState(false);
+  React.useEffect(() => {
+    if (!ctrlCHint) return;
+    const t = setTimeout(() => {
+      ctrlCArmedAtRef.current = null;
+      setCtrlCHint(false);
+    }, CTRL_C_EXIT_WINDOW_MS);
+    return () => clearTimeout(t);
+  }, [ctrlCHint]);
+  // A turn is running while the agent thinks, a tool runs, or a live phase
+  // is reported. Esc interrupts it; Esc's exit/back bindings apply only when
+  // nothing is running.
+  const turnRunning = state.isThinking || state.toolSteps.some((s) => s.status === 'running') || Boolean(state.liveActivity);
+
+  // Canonical command list lives in the shared input composer (single source
+  // of truth for the main TUI AND the attach TUI — see input-composer.tsx).
+  const slashCommands = SLASH_COMMANDS;
+
+  const slashSuggestions = React.useMemo(
+    () => buildSlashSuggestions(input, slashCommands, state.botRoster.length > 0
+      ? state.botRoster.map((b) => ({ id: b.id, name: b.name }))
+      : []),
+    [input, slashCommands, state.botRoster],
+  );
+
+  const [slashSelIdx, setSlashSelIdx] = React.useState(0);
+
+  // Reset selection index when suggestions change
+  React.useEffect(() => {
+    setSlashSelIdx(0);
+  }, [slashSuggestions.length, input]);
+
+  // ── Skill picker (`#name` prefix) ──
+  // Mirrors the slash picker. Triggered when input starts with `#`. Matches
+  // skills by name prefix first, then by name-substring, then by
+  // description-substring (case-insensitive). The selected entry inserts as
+  // `#skill-name ` so the user can continue typing their request.
+  // Matching logic lives in the shared input composer.
+  const skillSuggestions = React.useMemo(
+    () => buildSkillSuggestions(input, (state.skills || []).map((s) => ({ name: s.name, description: s.description || '' }))),
+    [input, state.skills],
+  );
+
+  // Skill rows render as "#name — description" strings in the shared popup.
+  const skillSuggestionStrings = React.useMemo(
+    () => skillSuggestions.map((s) => `#${s.name}`),
+    [skillSuggestions],
+  );
+
+  const [skillSelIdx, setSkillSelIdx] = React.useState(0);
+  React.useEffect(() => {
+    setSkillSelIdx(0);
+  }, [skillSuggestions.length, input]);
+
+  const showInput = state.mode !== 'mercury-code' && !state.permissionPrompt && (state.mode === 'chat' || state.mode === 'coding' || state.mode === 'workspace');
+  // Hardware cursor (IME anchor): only while the composer actually receives
+  // typed text. In the workspace IDE the arrows drive the explorer / code /
+  // git panes until the chat pane is focused or the user starts typing.
+  const inputOwnsKeys = showInput
+    && (state.mode !== 'workspace' || state.workspace?.focusArea === 'chat' || input.length > 0);
+
+  const completeSkillSelection = React.useCallback(() => {
+    const picked = skillSuggestions[skillSelIdx];
+    if (!picked) return false;
+    // Shared fill helper: keeps any remainder typed after the hash-token.
+    setInputAndCursor(skillFillText(input, picked.name));
+    return true;
+  }, [skillSuggestions, skillSelIdx, input]);
+
+  // One tip per launch, picked once so it does not change on re-render.
+  const launchTip = React.useMemo(() => rotateTip('chat')?.tip ?? null, []);
+
+  React.useEffect(() => {
+    if (state.mode === 'spotify' && spotifyClient) {
+      const refresh = async () => {
+        try {
+          const data = await spotifyClient.getCurrentlyPlaying();
+          setSpotifyNow(formatNowPlaying(data));
+          setSpotifyVolume(typeof data?.device?.volume_percent === 'number' ? data.device.volume_percent : null);
+          setSpotifyArtUrl(data?.item?.album?.images?.[0]?.url || null);
+        } catch {
+          setSpotifyNow('Nothing playing');
+          setSpotifyVolume(null);
+          setSpotifyArtUrl(null);
+        }
+      };
+      refresh();
+      const interval = setInterval(refresh, 5000);
+      return () => clearInterval(interval);
+    }
+  }, [state.mode, spotifyClient]);
+
+  React.useEffect(() => {
+    if (state.mode !== 'spotify') return;
+    if (!spotifyArtUrl) {
+      setSpotifyArtAnsi('');
+      return;
+    }
+    if (!canRenderInlineAlbumArt()) {
+      setSpotifyArtAnsi('');
+      return;
+    }
+
+    const cached = albumArtCache.current.get(spotifyArtUrl);
+    if (cached) {
+      setSpotifyArtAnsi(cached);
+      return;
+    }
+
+    let cancelled = false;
+    buildItermInlineImage(spotifyArtUrl)
+      .then((ansi) => {
+        if (cancelled) return;
+        albumArtCache.current.set(spotifyArtUrl, ansi);
+        setSpotifyArtAnsi(ansi);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setSpotifyArtAnsi('');
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [state.mode, spotifyArtUrl]);
+
+  const runSpotifyAction = React.useCallback(async (action: string) => {
+    if (!spotifyClient || action === 'exit') return;
+    try {
+      if (action === 'volume_up') {
+        const current = typeof spotifyVolume === 'number' ? spotifyVolume : 50;
+        const next = Math.min(100, current + 10);
+        const result = await spotifyClient.setVolume(next);
+        setSpotifyStatus(result);
+      } else if (action === 'volume_down') {
+        const current = typeof spotifyVolume === 'number' ? spotifyVolume : 50;
+        const next = Math.max(0, current - 10);
+        const result = await spotifyClient.setVolume(next);
+        setSpotifyStatus(result);
+      } else {
+        const { handlePlayerAction } = await import('../spotify/ui.js');
+        const result = await handlePlayerAction(action, spotifyClient);
+        setSpotifyStatus(result);
+      }
+
+      const data = await spotifyClient.getCurrentlyPlaying();
+      setSpotifyNow(formatNowPlaying(data));
+      setSpotifyVolume(typeof data?.device?.volume_percent === 'number' ? data.device.volume_percent : null);
+      setSpotifyArtUrl(data?.item?.album?.images?.[0]?.url || null);
+    } catch (err: any) {
+      setSpotifyStatus(err?.message || 'Spotify action failed');
+    }
+  }, [spotifyClient, spotifyVolume]);
+
+  React.useEffect(() => {
+    if (state.permissionPrompt) {
+      setPermIdx(0);
+      permIdxRef.current = 0;
+    }
+  }, [state.permissionPrompt]);
+
+  useInput((ch, key) => {
+    const keyChar = (ch || (key as any)?.name || '').toLowerCase();
+    const isEnter = (key.return || (key as any)?.name === 'enter') && !isPasteChunk(ch);
+    const resolvePermissionAndMaybeContinue = (value: string | boolean) => {
+      const shouldAutoEnterChat = state.mode === 'splash' && state.permissionPrompt?.type === 'mode';
+      onPermissionResolve(value);
+      if (shouldAutoEnterChat) {
+        onInput('/chat');
+      }
+    };
+
+    if (ch === '\u0003' || (key.ctrl && ((key as any).name === 'c' || ch?.toLowerCase?.() === 'c'))) {
+      const editable = showInput || state.mode === 'mercury-code';
+      const action = ctrlCAction(editable ? input : '', ctrlCArmedAtRef.current, Date.now());
+      if (action === 'clear') {
+        setInputAndCursor('');
+        ctrlCArmedAtRef.current = null;
+        setCtrlCHint(false);
+        return;
+      }
+      if (action === 'exit') {
+        ctrlCArmedAtRef.current = null;
+        onExit();
+        return;
+      }
+      ctrlCArmedAtRef.current = Date.now();
+      setCtrlCHint(true);
+      return;
+    }
+
+    if (state.mode === 'splash' && !state.permissionPrompt) {
+      if (key.tab) {
+        setShowStartupDetails((v) => !v);
+        return;
+      }
+      if (isEnter) {
+        onInput('/chat');
+        return;
+      }
+      // Typing anywhere starts chat with that text already in the input:
+      // keystrokes on the launch pad are never dropped.
+      if (ch && !key.ctrl && !key.meta && !key.escape && [...ch].some((c) => { const code = c.codePointAt(0) ?? 0; return code >= 0x20 && code !== 0x7f; })) {
+        onInput('/chat');
+        const text = ch.replace(/[\r\n]+$/, '');
+        setInputAndCursor(text);
+        return;
+      }
+      return;
+    }
+
+    // ── Mercury Code full-screen mode ──
+    // A pending interactive prompt (ask_user choice, permission, continue)
+    // owns the keyboard — its navigation handler below must receive keys,
+    // otherwise the model waits forever on an unanswered picker.
+    if (state.mode === 'mercury-code' && !state.permissionPrompt) {
+      const mc = state.mercuryCode;
+      if (!mc) return;
+
+      // Exit confirmation overlay: Esc cancels, y/Enter confirms, Ctrl+D force-quits.
+      if (mc.exitConfirm) {
+        if (key.escape) { onInput('/mc exit-cancel'); return; }
+        if (isEnter || ch === 'y' || ch === 'Y') { onInput('/mc exit-confirm'); return; }
+        if (key.ctrl && (ch === 'd' || ch === 'D')) { onInput('/mc exit-force'); return; }
+        if (ch === 'n' || ch === 'N') { onInput('/mc exit-cancel'); return; }
+        return;
+      }
+
+      // Esc while a turn runs interrupts it. Esc-Esc to leave Mercury Code
+      // applies only when nothing is running.
+      if (key.escape && turnRunning) {
+        onInterrupt?.();
+        return;
+      }
+      // Ask agent to exit: arms the confirm overlay.
+      if (key.escape && state.exitEscArmed) {
+        onInput('/mc exit-arm');
+        return;
+      }
+      if (key.escape) { onInput('/mc esc-arm'); return; }
+
+      if (key.ctrl && (ch === 'd' || ch === 'D')) { onInput('/mc exit-force'); return; }
+
+      // Scroll lock (freeze): stop all frame writes so the user can scroll,
+      // read, and copy in native scrollback while a response streams. The
+      // chat continues underneath; Ctrl+S again resumes.
+      if (key.ctrl && (ch === 's' || ch === 'S' || ch === '\x13')) { onInput('/mc freeze-toggle'); return; }
+
+      // Ctrl+P / Ctrl+X plan/execute shortcuts
+      if (key.ctrl && (ch === 'p' || ch === 'P')) { onInput('/code plan'); return; }
+      if (key.ctrl && (ch === 'x' || ch === 'X')) { onInput('/code execute'); return; }
+      if (key.ctrl && (ch === 'g' || ch === 'G')) { onInput('/code diff'); return; }
+      if (key.ctrl && (ch === 'o' || ch === 'O' || ch === '\x0f')) { onInput('/mc expand'); return; }
+
+      // A bracketed paste is literal text — never Enter, even when the
+      // payload is a single "\n".
+      if (isEnter) {
+        const trimmed = input.trim();
+        if (trimmed) {
+          onInput(trimmed);
+          // Shared composer history helper (dedup + cap in one place —
+          // input-composer.tsx is the single source of truth for both TUIs).
+          recordHistory(trimmed);
+          setInputAndCursor('');
+        }
+        return;
+      }
+
+      if (key.tab) return;
+
+      // Transcript scrolling is terminal-native now (the transcript prints
+      // into scrollback via <Static>): ↑/↓ navigate input history instead.
+      // Shared composer history helpers (same behavior as chat mode).
+      if (key.upArrow && !key.meta && !key.ctrl) {
+        if (inputHistory.history.length === 0) return;
+        const h = historyPrev(inputHistory, input);
+        setInputHistory(h.state);
+        setInputAndCursor(h.input);
+        return;
+      }
+      if (key.downArrow && !key.meta && !key.ctrl) {
+        if (inputHistory.index === -1) return;
+        const h = historyNext(inputHistory);
+        setInputHistory(h.state);
+        setInputAndCursor(h.input);
+        return;
+      }
+      // Shared editing reducer: paste, newline (Ctrl+N / Shift+Enter),
+      // grapheme-aware cursor moves and deletes, word moves, Ctrl+W/U/K —
+      // one pipeline for the attach TUI, chat mode and Mercury Code.
+      const edited = applyEditKey(input, cursorPos, ch, key as EditorKey);
+      if (edited) {
+        setInput(edited.input);
+        setCursorPos(edited.cursorPos);
+      }
+      return;
+    }
+
+    if (state.permissionPrompt) {
+      const options = state.permissionPrompt.options || [];
+      if (options.length > 0) {
+        const lower = ch?.toLowerCase?.();
+        if (lower === 'y') {
+          const yes = options.find((opt) => opt.value === 'yes');
+          if (yes) {
+            resolvePermissionAndMaybeContinue(yes.value);
+            return;
+          }
+        }
+        if (lower === 'n') {
+          const no = options.find((opt) => opt.value === 'no');
+          if (no) {
+            resolvePermissionAndMaybeContinue(no.value);
+            return;
+          }
+        }
+        if (lower === 'a') {
+          const always = options.find((opt) => opt.value === 'always');
+          if (always) {
+            resolvePermissionAndMaybeContinue(always.value);
+            return;
+          }
+        }
+
+        if (key.upArrow) {
+          const next = Math.max(0, permIdxRef.current - 1);
+          permIdxRef.current = next;
+          setPermIdx(next);
+        }
+        else if (key.downArrow) {
+          const next = Math.min(options.length - 1, permIdxRef.current + 1);
+          permIdxRef.current = next;
+          setPermIdx(next);
+        }
+        else if (isEnter) {
+          const selected = options[permIdxRef.current] || options[0];
+          if (selected) resolvePermissionAndMaybeContinue(selected.value);
+        } else if (key.escape) {
+          if (state.permissionPrompt.type === 'mode') resolvePermissionAndMaybeContinue('ask-me');
+          else if (state.permissionPrompt.type === 'choice') resolvePermissionAndMaybeContinue('');
+          else resolvePermissionAndMaybeContinue('no');
+        }
+        return;
+      }
+
+      if (state.permissionPrompt.type === 'continue') {
+        if (ch === 'y' || ch === 'Y') resolvePermissionAndMaybeContinue(true);
+        else if (ch === 'n' || ch === 'N') resolvePermissionAndMaybeContinue(false);
+        return;
+      }
+      if (state.permissionPrompt.type === 'ask') {
+        if (isEnter) resolvePermissionAndMaybeContinue('');
+        return;
+      }
+      return;
+    }
+
+    if (state.mode === 'menu') {
+      if (key.upArrow) setMenuIdx((i) => Math.max(0, i - 1));
+      else if (key.downArrow) setMenuIdx((i) => Math.min(5, i + 1));
+      else if (key.return) {
+        const modes: AppMode[] = ['menu', 'coding', 'chat', 'spotify', 'chat', 'chat'];
+        onInput('/' + modes[menuIdx]);
+        setMenuIdx(0);
+      }
+      else if (key.escape) onInput('/chat');
+      return;
+    }
+
+    if (state.mode === 'spotify') {
+      if (ch === 'n' || ch === 'N') {
+        runSpotifyAction('next');
+        return;
+      }
+      if (ch === 'p' || ch === 'P') {
+        runSpotifyAction('prev');
+        return;
+      }
+      if (ch === ' ') {
+        runSpotifyAction('play');
+        return;
+      }
+      if (ch === '+' || ch === '=') {
+        runSpotifyAction('volume_up');
+        return;
+      }
+      if (ch === '-') {
+        runSpotifyAction('volume_down');
+        return;
+      }
+      if (ch === 'z' || ch === 'Z') {
+        runSpotifyAction('now');
+        return;
+      }
+
+      if (key.upArrow) setSpotifyIdx((i) => Math.max(0, i - 1));
+      else if (key.downArrow) setSpotifyIdx((i) => Math.min(PLAYER_CONTROLS.length - 1, i + 1));
+      else if (key.return) {
+        const action = PLAYER_CONTROLS[spotifyIdx];
+        if (action && action.value !== 'exit') runSpotifyAction(action.value);
+        if (action?.value === 'exit') onInput('/chat');
+      } else if (key.escape) onInput('/chat');
+      return;
+    }
+
+    if (isEnter) {
+      const trimmed = input.trim();
+
+      // If autocomplete popup is showing and input doesn't exactly match the selected suggestion,
+      // fill the suggestion into the input instead of submitting
+      if (!shouldSubmitSlash(slashSuggestions, trimmed, slashSelIdx)) {
+        setInputAndCursor(slashSuggestions[slashSelIdx]);
+        return;
+      }
+
+      // Skill picker: first Enter fills the selection (so the user can keep
+      // typing their request after the skill name); second Enter submits.
+      if (skillSuggestions.length > 0) {
+        const picked = skillSuggestions[skillSelIdx];
+        const expected = picked ? `#${picked.name}` : '';
+        if (picked && !trimmed.startsWith(expected + ' ') && trimmed !== expected) {
+          completeSkillSelection();
+          return;
+        }
+      }
+
+      if (trimmed) {
+        onInput(trimmed);
+        // Shared composer history helper (dedup + cap in one place —
+        // input-composer.tsx is the single source of truth for both TUIs).
+        recordHistory(trimmed);
+        setInputAndCursor('');
+        return;
+      }
+    }
+
+    if (state.mode === 'workspace') {
+      const focusArea = state.workspace?.focusArea || 'explorer';
+      const rightPanel = state.workspace?.rightPanel || 'chat';
+
+      // Global workspace shortcuts (always active). Esc leaves/returns only
+      // when no turn is running — otherwise it falls through to interrupt.
+      if ((key.escape && !turnRunning) || (key.ctrl && (ch === 'q' || ch === 'Q'))) {
+        // Esc in non-explorer panel returns to explorer; Esc in explorer exits workspace
+        if (focusArea !== 'explorer') {
+          onInput('/ws focus explorer');
+        } else {
+          onInput('/ws exit');
+        }
+        return;
+      }
+
+      if (key.ctrl && (ch === 'p' || ch === 'P')) {
+        onInput('/code plan');
+        return;
+      }
+      if (key.ctrl && (ch === 'x' || ch === 'X')) {
+        onInput('/code execute');
+        return;
+      }
+
+      // Panel focus shortcuts
+      if (key.ctrl && (ch === 'e' || ch === 'E')) {
+        onInput('/ws focus explorer');
+        return;
+      }
+      if (key.ctrl && (ch === 'g' || ch === 'G')) {
+        onInput('/ws focus git');
+        return;
+      }
+      if (key.ctrl && (ch === 'j' || ch === 'J')) {
+        onInput('/ws toggle-chat');
+        return;
+      }
+
+      // Tab cycles focus: explorer → code → right panel (chat or git)
+      if (key.tab) {
+        const showRight = terminalSize.cols >= 100;
+        const rightFocus = rightPanel === 'chat' ? 'chat' : 'git';
+        const cycle = showRight ? ['explorer', 'code', rightFocus] : ['explorer', 'code'];
+        const nextIdx = (cycle.indexOf(focusArea) + 1) % cycle.length;
+        onInput(`/ws focus ${cycle[nextIdx]}`);
+        return;
+      }
+
+      const navMode = input.trim().length === 0;
+
+      // Focus-aware navigation
+      if (navMode) {
+        if (focusArea === 'explorer') {
+          if (key.upArrow) { onInput('/ws up'); return; }
+          if (key.downArrow) { onInput('/ws down'); return; }
+          if (key.leftArrow) { onInput('/ws collapse'); return; }
+          if (key.rightArrow) { onInput('/ws expand'); return; }
+          if (isEnter) { onInput('/ws open-selected'); return; }
+        }
+
+        if (focusArea === 'code') {
+          const viewerLines = Math.max(1, (terminalSize.rows - 11));
+          if (key.upArrow) { onInput(`/ws scroll -1 ${viewerLines}`); return; }
+          if (key.downArrow) { onInput(`/ws scroll 1 ${viewerLines}`); return; }
+          if (key.pageUp) { onInput(`/ws scroll ${-viewerLines} ${viewerLines}`); return; }
+          if (key.pageDown) { onInput(`/ws scroll ${viewerLines} ${viewerLines}`); return; }
+          if (key.ctrl && (ch === 'u' || ch === 'U')) { onInput(`/ws scroll ${-viewerLines} ${viewerLines}`); return; }
+          if (key.ctrl && (ch === 'd' || ch === 'D')) { onInput(`/ws scroll ${viewerLines} ${viewerLines}`); return; }
+          if ((key as any).home) { onInput('/ws scroll-home'); return; }
+          if ((key as any).end) { onInput(`/ws scroll-end ${viewerLines}`); return; }
+        }
+
+        if (focusArea === 'git') {
+          if (key.upArrow) { setGitCursor((i) => Math.max(0, i - 1)); return; }
+          if (key.downArrow) { setGitCursor((i) => Math.min((state.workspace?.gitFiles.length || 1) - 1, i + 1)); return; }
+          if (isEnter) {
+            const picked = state.workspace?.gitFiles[gitCursor];
+            if (picked) onInput(`/ws stage ${picked.path}`);
+            return;
+          }
+        }
+
+        if (focusArea === 'chat') {
+          if (key.upArrow) { onInput('/ws chat-scroll 1'); return; }
+          if (key.downArrow) { onInput('/ws chat-scroll -1'); return; }
+          if (key.pageUp) { onInput('/ws chat-scroll 10'); return; }
+          if (key.pageDown) { onInput('/ws chat-scroll -10'); return; }
+          if (key.ctrl && (ch === 'u' || ch === 'U')) { onInput('/ws chat-scroll 10'); return; }
+          if (key.ctrl && (ch === 'd' || ch === 'D')) { onInput('/ws chat-scroll -10'); return; }
+          if ((key as any).home) { onInput('/ws chat-home'); return; }
+          if ((key as any).end) { onInput('/ws chat-end'); return; }
+        }
+      }
+    }
+
+    if (state.mode === 'splash') return;
+
+    if ((state.mode === 'coding' || state.mode === 'workspace') && !state.permissionPrompt) {
+      if (key.ctrl && (ch === 'p' || ch === 'P')) {
+        onInput('/code plan');
+        return;
+      }
+      if (key.ctrl && (ch === 'x' || ch === 'X')) {
+        onInput('/code execute');
+        return;
+      }
+    }
+
+    if (key.ctrl && (ch === 't' || ch === 'T') && !state.permissionPrompt) {
+      onInput('/view toggle');
+      return;
+    }
+
+    if (key.ctrl && (ch === 'b' || ch === 'B') && !state.permissionPrompt) {
+      onInput(state.isThinking ? '/bg current' : '/bg list');
+      return;
+    }
+
+    // Ctrl+D → show last task's step log (when not in workspace nav mode,
+    // which uses Ctrl+D for scrolling).  Splash mode also uses 'd' key.
+    if (key.ctrl && (ch === 'd' || ch === 'D') && !state.permissionPrompt && state.mode !== 'workspace') {
+      onInput('/log');
+      return;
+    }
+
+    if (key.escape) {
+      if (turnRunning) {
+        onInterrupt?.();
+        return;
+      }
+      if (state.mode === 'coding') {
+        onInput('/chat');
+      }
+      return;
+    }
+
+    if (isEnter) return;
+
+    if (key.tab) {
+      if (input.startsWith('/') && slashSuggestions.length > 0) {
+        setInputAndCursor(slashSuggestions[slashSelIdx]);
+      } else if (input.startsWith('#') && skillSuggestions.length > 0) {
+        completeSkillSelection();
+      }
+      return;
+    }
+
+    // Up/down arrow: navigate slash suggestions when popup is visible
+    if (slashSuggestions.length > 0) {
+      if (key.upArrow) {
+        setSlashSelIdx((i) => (i > 0 ? i - 1 : slashSuggestions.length - 1));
+        return;
+      }
+      if (key.downArrow) {
+        setSlashSelIdx((i) => (i < slashSuggestions.length - 1 ? i + 1 : 0));
+        return;
+      }
+    }
+
+    // Up/down arrow: navigate skill (#) suggestions when popup is visible
+    if (skillSuggestions.length > 0) {
+      if (key.upArrow) {
+        setSkillSelIdx((i) => (i > 0 ? i - 1 : skillSuggestions.length - 1));
+        return;
+      }
+      if (key.downArrow) {
+        setSkillSelIdx((i) => (i < skillSuggestions.length - 1 ? i + 1 : 0));
+        return;
+      }
+    }
+
+    // Up arrow: navigate input history (shared composer helpers)
+    if (key.upArrow) {
+      if (inputHistory.history.length === 0) return;
+      const h = historyPrev(inputHistory, input);
+      setInputHistory(h.state);
+      setInputAndCursor(h.input);
+      return;
+    }
+
+    if (key.downArrow) {
+      if (inputHistory.index === -1) return;
+      const h = historyNext(inputHistory);
+      setInputHistory(h.state);
+      setInputAndCursor(h.input);
+      return;
+    }
+
+    // Shared editing reducer: paste, newline (Ctrl+N / Shift+Enter),
+    // grapheme-aware cursor moves and deletes, word moves, Ctrl+W/U/K —
+    // one pipeline for the attach TUI, chat mode and Mercury Code.
+    const edited = applyEditKey(input, cursorPos, ch, key as EditorKey);
+    if (edited) {
+      setInput(edited.input);
+      setCursorPos(edited.cursorPos);
+    }
+  });
+
+  if (state.mode === 'splash') {
+    return (
+      <Box flexDirection="column" flexGrow={1}>
+        <LaunchPad state={state} cols={terminalSize.cols} showDetails={showStartupDetails} tip={launchTip} />
+        {state.permissionPrompt && (
+          <PermPromptView prompt={state.permissionPrompt} activeIdx={permIdx} />
+        )}
+      </Box>
+    );
+  }
+
+  return (
+    <Box flexDirection="column" flexGrow={1}>
+      {state.backgroundTasks.length > 0 && <BackgroundBarView tasks={state.backgroundTasks} cols={terminalSize.cols} />}
+      {state.mode === 'mercury-code' ? (
+        <MercuryCodeView
+          state={state}
+          cols={terminalSize.cols}
+          rows={terminalSize.rows}
+          input={input}
+          cursorPos={cursorPos}
+          permIdx={permIdx}
+          ctrlCHint={ctrlCHint}
+        />
+      ) : null}
+      {state.mode === 'spotify' ? <SpotifyBody activeIdx={spotifyIdx} nowPlaying={spotifyNow} status={spotifyStatus} volume={spotifyVolume} albumArtAnsi={spotifyArtAnsi} /> : null}
+      {state.mode === 'menu' ? <MenuBody menuIdx={menuIdx} /> : null}
+      {state.mode === 'coding' ? <CodingBody state={state} maxDynamicLines={Math.min(12, Math.max(3, terminalSize.rows - 14))} cols={terminalSize.cols} /> : null}
+      {state.mode === 'workspace' ? (
+        <WorkspaceBody state={state} gitCursor={gitCursor} height={Math.max(8, terminalSize.rows - 6)} cols={terminalSize.cols} onInput={onInput} />
+      ) : null}
+      {state.mode === 'chat' ? (
+        // Live-region cap: only the newest few lines of the streaming message
+        // repaint per frame — finalized content is already in <Static>. A
+        // near-full-screen live region was rewritten every 60ms frame, which
+        // read as a visible "on-off" flicker on long chats.
+        <ChatBody state={state} maxDynamicLines={Math.min(12, Math.max(3, terminalSize.rows - 14))} cols={terminalSize.cols} />
+      ) : null}
+      {state.permissionPrompt && state.mode !== 'mercury-code' && (
+        <PermPromptView prompt={state.permissionPrompt} activeIdx={permIdx} />
+      )}
+      {showInput && state.mode !== 'mercury-code' && (
+        <InputBox
+          input={input}
+          cursorPos={cursorPos}
+          mode={state.mode}
+          programmingMode={state.programmingMode}
+          projectContext={state.projectContext}
+          botChat={state.botChat}
+          botsWorking={state.botRoster.filter((b) => b.state === 'running').length}
+          turnRunning={turnRunning}
+          ctrlCHint={ctrlCHint}
+          cursorActive={inputOwnsKeys}
+          cols={terminalSize.cols}
+        />
+      )}
+      {showInput && state.mode !== 'mercury-code' && slashSuggestions.length > 0 && (
+        <SuggestionList kind="slash" suggestions={slashSuggestions} selectedIndex={slashSelIdx} />
+      )}
+      {showInput && state.mode !== 'mercury-code' && skillSuggestions.length > 0 && (
+        <SuggestionList kind="skill" suggestions={skillSuggestionStrings} selectedIndex={skillSelIdx} />
+      )}
+      {state.mode !== 'mercury-code' && <TokenBarView state={state} cols={terminalSize.cols} />}
+    </Box>
+  );
+}
+
+function BackgroundBarView({ tasks, cols }: { tasks: BackgroundTaskInfo[]; cols: number }) {
+  if (tasks.length === 0) return null;
+
+  const statusIcons: Record<string, string> = {
+    running: '⏳',
+    completed: '✅',
+    failed: '❌',
+    timed_out: '⏱',
+    cancelled: '⛔',
+  };
+
+  const visible = tasks.slice(0, 3);
+  const more = tasks.length > 3 ? ` +${tasks.length - 3} more` : '';
+
+  return (
+    <Box paddingX={1} paddingBottom={0} flexShrink={0} flexDirection="column">
+      <Text color="gray">{'─'.repeat(ruleWidth(cols, 50))}</Text>
+      <Box flexDirection="column" width="100%">
+        <Box height={1} overflow="hidden">
+          <Text dimColor>⏥ Background:</Text>
+          <Text wrap="truncate-end"> {visible.map((t) => {
+            const icon = statusIcons[t.status] || '·';
+            const label = t.command || t.task || t.id;
+            const short = label.length > 25 ? label.slice(0, 22) + '...' : label;
+            const elapsed = t.runningMs ? ` (${Math.round(t.runningMs / 1000)}s)` : '';
+            return `${icon} ${t.id}: ${short}${elapsed}`;
+          }).join(' · ')}{more}</Text>
+        </Box>
+      </Box>
+    </Box>
+  );
+}
+
+const HEADER_SENTINEL_ID = '__mercury_header__';
+
+/**
+ * Static-output bound: number of finalized messages Ink's <Static> retains.
+ * Everything older remains in the session store; the live transcript box
+ * still shows the tail. This keeps fullStaticOutput bounded regardless of
+ * session length.
+ */
+const MAX_STATIC_MESSAGES = 100;
+
+/**
+ * Identity for Ink <Static> item dedup (patched Static.js `itemKey` prop).
+ * Ink's built-in positional index assumes `items` only ever appends; this
+ * window drops the oldest entries once the transcript exceeds
+ * MAX_STATIC_MESSAGES, which under the positional scheme made
+ * `items.slice(index)` empty — new messages stopped rendering and every
+ * commit unmounted the entire static subtree (freed Yoga nodes churned each
+ * frame). Identity-based dedup renders each item exactly once per <Static>
+ * instance regardless of window shifts.
+ */
+const staticItemKey = (item: string | ChatMessage): string => typeof item === 'string' ? item : item.id;
+
+function HeaderBanner({ cols }: { cols: number }): React.ReactNode {
+  return (
+    <Box flexDirection="column" flexShrink={0}>
+      <Box paddingX={1}>
+        <Text color={BRAND.logo}>☿</Text>
+        <Text> </Text>
+        <Text bold color={BRAND.title}>MERCURY</Text>
+        {!isNarrow(cols) && <Text color={BRAND.subtitle}> · Your soul-driven AI agent</Text>}
+      </Box>
+      <Box paddingX={1}>
+        <Text color="gray">{'─'.repeat(ruleWidth(cols, 50))}</Text>
+      </Box>
+    </Box>
+  );
+}
+
+function TokenBarView({ state, cols }: { state: TuiState; cols: number }) {
+  if (!state.tokenInfo && !state.provider && !state.currentSession && !state.desktopActivity) return null;
+
+  const saverActive = !!(state.saverInfo && state.saverInfo.state !== 'off');
+  const saverColor = state.saverInfo?.state === 'auto' ? 'yellow' : 'green';
+  const pct = state.tokenInfo?.percentage ?? 0;
+
+  const runningAgents = state.subAgents.filter((a) => a.status === 'running' || a.status === 'paused').length;
+  const runningBg = state.backgroundTasks.filter((t) => t.status === 'running').length;
+  const isWorkspace = state.mode === 'workspace' && state.workspace;
+
+  // Shared status-row builder (src/ui/status-bar.ts): priority order with
+  // compact forms, so a long model or session name never crowds the rest.
+  const extras: StatusSegment[] = [];
+  if (saverActive) extras.push({ text: `⚡ saver${state.saverInfo!.savedToday > 0 ? ` ~${formatCompact(state.saverInfo!.savedToday)}` : ''}`, compact: '⚡', color: saverColor, priority: 4 });
+  if (isWorkspace && state.workspace) {
+    const ws = state.workspace;
+    let wsStr = `⎇ ${ws.branch}`;
+    if (ws.ahead > 0) wsStr += ` ↑${ws.ahead}`;
+    if (ws.behind > 0) wsStr += ` ↓${ws.behind}`;
+    if (ws.stagedCount > 0) wsStr += ` S${ws.stagedCount}`;
+    if (ws.unstagedCount > 0) wsStr += ` M${ws.unstagedCount}`;
+    extras.push({ text: wsStr, compact: `⎇ ${ws.branch}`, color: 'blue', priority: 2 });
+  }
+  if (!isWorkspace && runningBg > 0) extras.push({ text: `⏳ ${runningBg} in background`, compact: `⏳${runningBg}`, color: 'cyan', priority: 3 });
+  if (!isWorkspace && runningAgents > 0) extras.push({ text: `🤖 ${runningAgents} agent${runningAgents !== 1 ? 's' : ''}`, compact: `🤖${runningAgents}`, color: 'magenta', priority: 3 });
+  const visible = fitSegments(statusSegments({
+    provider: state.provider,
+    permission: state.permissionMode,
+    tokensPct: state.tokenInfo ? pct : null,
+    desktop: state.desktopActivity,
+    updateAvailable: state.updateAvailable,
+    session: state.currentSession,
+    extras,
+  }), Math.max(20, cols - 2));
+  const sepStr = ' · ';
+
+  return (
+    <Box flexDirection="column" flexShrink={0}>
+      <Box paddingX={1}>
+        <Text color="gray">{'─'.repeat(Math.max(20, cols - 2))}</Text>
+      </Box>
+      <Box paddingX={1} paddingBottom={0} height={1} overflow="hidden">
+        {visible.map((seg, i) => (
+          <React.Fragment key={i}>
+            {i > 0 && <Text color="gray">{sepStr}</Text>}
+            <Text color={seg.color} wrap="truncate">{seg.text}</Text>
+          </React.Fragment>
+        ))}
+      </Box>
+    </Box>
+  );
+}
+
+function truncateStr(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  return text.slice(0, Math.max(1, maxLen - 1)) + '…';
+}
+
+function formatCompact(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+function ChatBody({ state, maxDynamicLines, cols }: { state: TuiState; maxDynamicLines: number; cols: number }) {
+  // Static-output bound: Ink's <Static> accumulates every rendered item in a
+  // monotonically growing output string that is re-written on each frame.
+  // Retaining the entire transcript there is O(N²) work and permanent heap;
+  // older messages live in the session store, so the TUI keeps a bounded
+  // recent window. The window is safe because <Static> dedupes by itemKey —
+  // see the staticItemKey note above MAX_STATIC_MESSAGES.
+  const staticMessages = state.chatMessages.filter((message) => !message.streaming && !message.id.startsWith('heartbeat-')).slice(-MAX_STATIC_MESSAGES);
+  // ThinkingIndicator owns transient progress; do not duplicate heartbeat
+  // messages in the conversation transcript above it.
+  const dynamicMessages = state.chatMessages.filter((message) => message.streaming && !message.id.startsWith('heartbeat-'));
+  const staticItems: Array<string | ChatMessage> = [HEADER_SENTINEL_ID, ...staticMessages];
+  return (
+    <Box flexDirection="row" flexGrow={1}>
+      {state.sidebarSections.length > 0 && sidePanelWidth(cols, 24) > 0 && <SidebarView sections={state.sidebarSections} />}
+      <Box flexDirection="column" flexGrow={1}>
+        <Static items={staticItems} itemKey={staticItemKey}>
+          {(item) => typeof item === 'string'
+            ? <HeaderBanner key={item} cols={cols} />
+            : <ChatMessagesView key={item.id} messages={[item]} agentName={state.agentName} />}
+        </Static>
+        <StreamingMessagesView messages={dynamicMessages} agentName={state.agentName} maxLines={maxDynamicLines} width={cols - (state.sidebarSections.length > 0 && sidePanelWidth(cols, 24) > 0 ? 30 : 0)} />
+        {state.toolSteps.length > 0 && !state.isThinking && <ToolStepsView steps={state.toolSteps} viewMode={state.viewMode} idle />}
+        {state.isThinking && <ThinkingIndicator agentName={state.agentName} steps={state.toolSteps} mode={state.mode} liveActivity={state.liveActivity} thinkingPreview={state.thinkingPreview} />}
+        {state.botChat && !state.isThinking && (
+          <BotFleetLiveRegion
+            botId={state.botChat.botId}
+            botName={state.botChat.botName}
+            botLiveActivity={state.botLiveActivity ?? {}}
+            botStreamTails={state.botStreamTails ?? {}}
+            botRoster={state.botRoster}
+          />
+        )}
+        {state.subAgents.length > 0 && <AgentPanelView agents={state.subAgents} cols={cols} />}
+      </Box>
+    </Box>
+  );
+}
+
+function CodingBody({ state, maxDynamicLines, cols }: { state: TuiState; maxDynamicLines: number; cols: number }) {
+  const modeLabels: Record<ProgrammingModeState, { label: string; color: string }> = {
+    off: { label: 'OFF', color: 'gray' },
+    auto: { label: 'AUTO', color: 'cyan' },
+    plan: { label: 'PLAN', color: 'yellow' },
+    execute: { label: 'EXECUTE', color: 'green' },
+  };
+  const modeInfo = modeLabels[state.programmingMode];
+  const fileSection = state.sidebarSections.find((s) => s.title === 'Files');
+  const staticMessages = state.chatMessages.filter((message) => !message.streaming && !message.id.startsWith('heartbeat-')).slice(-MAX_STATIC_MESSAGES);
+  // ThinkingIndicator owns transient progress; do not duplicate heartbeat
+  // messages in the conversation transcript above it.
+  const dynamicMessages = state.chatMessages.filter((message) => message.streaming && !message.id.startsWith('heartbeat-'));
+  const staticItems: Array<string | ChatMessage> = [HEADER_SENTINEL_ID, ...staticMessages];
+
+  const sidebarWidth = sidePanelWidth(cols, 26);
+  return (
+    <Box flexDirection="row" flexGrow={1}>
+      {sidebarWidth > 0 && (
+      <Box flexDirection="column" width={sidebarWidth} paddingX={1} flexShrink={0}>
+        <Text color="gray">{'─'.repeat(sidebarWidth - 2)}</Text>
+        <Text bold color="cyan">Workspace</Text>
+        <Box marginTop={1}>
+          <Text color={modeInfo.color} bold>{modeInfo.label}</Text>
+          <Text> mode</Text>
+        </Box>
+        {state.projectContext && <Box><Text dimColor>Project: {state.projectContext}</Text></Box>}
+        {fileSection && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold color="cyan">{fileSection.title}</Text>
+            {fileSection.items.slice(0, 10).map((item, i) => (
+              <Box key={i}><Text>{item.icon} </Text><Text color={item.active ? 'white' : 'gray'}>{item.label}</Text></Box>
+            ))}
+          </Box>
+        )}
+        {state.subAgents.length > 0 && <AgentPanelView agents={state.subAgents} cols={sidebarWidth} />}
+      </Box>
+      )}
+      <Box flexDirection="column" flexGrow={1}>
+        {sidebarWidth === 0 && state.subAgents.length > 0 && <AgentPanelView agents={state.subAgents} cols={cols} />}
+        <Static items={staticItems} itemKey={staticItemKey}>
+          {(item) => typeof item === 'string'
+            ? <HeaderBanner key={item} cols={cols} />
+            : <ChatMessagesView key={item.id} messages={[item]} agentName={state.agentName} />}
+        </Static>
+        <StreamingMessagesView messages={dynamicMessages} agentName={state.agentName} maxLines={maxDynamicLines} width={cols - (state.sidebarSections.length > 0 && sidePanelWidth(cols, 24) > 0 ? 30 : 0)} />
+        {state.toolSteps.length > 0 && !state.isThinking && <ToolStepsView steps={state.toolSteps} viewMode={state.viewMode} idle />}
+        {state.isThinking && <ThinkingIndicator agentName={state.agentName} steps={state.toolSteps} mode={state.mode} liveActivity={state.liveActivity} thinkingPreview={state.thinkingPreview} />}
+        {state.botChat && !state.isThinking && (
+          <BotFleetLiveRegion
+            botId={state.botChat.botId}
+            botName={state.botChat.botName}
+            botLiveActivity={state.botLiveActivity ?? {}}
+            botStreamTails={state.botStreamTails ?? {}}
+            botRoster={state.botRoster}
+          />
+        )}
+        <Box paddingX={1} marginTop={1} height={1} overflow="hidden">
+          <Text dimColor wrap="truncate-end">{isNarrow(cols) ? 'Ctrl+P Plan · Ctrl+X Execute' : 'Mode shortcuts: Ctrl+P Plan · Ctrl+X Execute (Auto runs by default)'}</Text>
+        </Box>
+      </Box>
+    </Box>
+  );
+}
+
+// ─── Workspace IDE ──────────────────────────────────────────────────────────
+
+function useTerminalSize(): { rows: number; cols: number } {
+  return useSharedTerminalSize();
+}
+
+function WorkspaceTabBar({ ws, focusArea, cols }: { ws: WorkspaceState; focusArea: string; cols: number }) {
+  const showRightPanel = cols >= 100;
+  const rightLabel = ws.rightPanel === 'chat' ? 'AGENT OUTPUT' : 'SOURCE CONTROL';
+  const rightFocus = ws.rightPanel === 'chat' ? 'chat' : 'git';
+  const tabs: Array<{ id: string; label: string }> = [
+    { id: 'explorer', label: 'EXPLORER' },
+    { id: 'code', label: 'CODE' },
+    ...(showRightPanel ? [{ id: rightFocus, label: rightLabel }] : []),
+  ];
+
+  return (
+    <Box paddingX={1}>
+      {tabs.map((tab, i) => (
+        <React.Fragment key={tab.id}>
+          {i > 0 && <Text color="gray"> │ </Text>}
+          <Text
+            bold={focusArea === tab.id}
+            inverse={focusArea === tab.id}
+            color={focusArea === tab.id ? 'cyan' : 'gray'}
+          >
+            {' '}{tab.label}{' '}
+          </Text>
+        </React.Fragment>
+      ))}
+      <Spacer />
+      {showRightPanel && (
+        <>
+          <Text dimColor>^J {ws.rightPanel === 'chat' ? 'git' : 'chat'}</Text>
+          <Text color="gray"> · </Text>
+        </>
+      )}
+      <Text color="magenta">{ws.branch}</Text>
+    </Box>
+  );
+}
+
+function ExplorerPanel({
+  ws,
+  panelHeight,
+  isFocused,
+}: {
+  ws: WorkspaceState;
+  panelHeight: number;
+  isFocused: boolean;
+}) {
+  const windowSize = Math.max(1, panelHeight - 3); // border + header
+  const explorerStart = Math.max(0, Math.min(ws.selectedIndex - Math.floor(windowSize / 2), Math.max(0, ws.nodes.length - windowSize)));
+  const visible = ws.nodes.slice(explorerStart, explorerStart + windowSize);
+
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor={isFocused ? 'cyan' : 'gray'}
+      overflow="hidden"
+      height={panelHeight}
+    >
+      <Box paddingX={1}>
+        <Text bold={isFocused} color={isFocused ? 'cyan' : 'gray'}>EXPLORER</Text>
+        <Spacer />
+        <Text dimColor>{ws.nodes.length}</Text>
+      </Box>
+      {visible.map((node, localIdx) => {
+        const idx = explorerStart + localIdx;
+        const isSelected = idx === ws.selectedIndex;
+        const prefix = node.isDir ? (node.expanded ? '▾' : '▸') : ' ';
+        const indent = ' '.repeat(Math.max(0, node.depth * 2));
+        return (
+          <Box key={node.id} paddingX={1}>
+            <Text
+              inverse={isSelected && isFocused}
+              color={isSelected ? 'white' : node.isDir ? 'blue' : 'gray'}
+              wrap="truncate-end"
+            >
+              {isSelected ? '›' : ' '} {indent}{prefix} {node.name}
+            </Text>
+          </Box>
+        );
+      })}
+      {visible.length < windowSize && Array.from({ length: windowSize - visible.length }, (_, i) => (
+        <Box key={`pad-${i}`}><Text> </Text></Box>
+      ))}
+    </Box>
+  );
+}
+
+function CodeViewerPanel({
+  ws,
+  panelHeight,
+  isFocused,
+}: {
+  ws: WorkspaceState;
+  panelHeight: number;
+  isFocused: boolean;
+}) {
+  const viewerLines = Math.max(1, panelHeight - 4); // border + header + footer
+  const preview = ws.openedFilePreview;
+  const totalLines = preview.length;
+  const maxOffset = Math.max(0, totalLines - viewerLines);
+  const offset = Math.max(0, Math.min(maxOffset, ws.codeScrollOffset));
+  const visibleLines = preview.slice(offset, offset + viewerLines);
+  const lineNumWidth = Math.max(3, String(offset + viewerLines).length);
+  const fileName = ws.openedFilePath
+    ? ws.openedFilePath.slice(ws.rootPath.length).replace(/^[/\\]+/, '') || ws.openedFilePath
+    : '';
+
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor={isFocused ? 'cyan' : 'gray'}
+      overflow="hidden"
+      height={panelHeight}
+    >
+      <Box paddingX={1}>
+        <Text bold={isFocused} color={isFocused ? 'cyan' : 'gray'}>CODE</Text>
+        {fileName ? (
+          <>
+            <Text color="gray"> · </Text>
+            <Text color="white" wrap="truncate-end">{fileName}</Text>
+          </>
+        ) : null}
+        <Spacer />
+        {totalLines > 0 && (
+          <Text dimColor>{offset + 1}-{Math.min(offset + viewerLines, totalLines)}/{totalLines}</Text>
+        )}
+      </Box>
+      {!ws.openedFilePath ? (
+        <Box flexDirection="column" flexGrow={1} alignItems="center" justifyContent="center">
+          <Text dimColor>Select a file and press Enter</Text>
+          <Text dimColor>to preview its contents</Text>
+        </Box>
+      ) : (
+        <>
+          {visibleLines.map((line, i) => {
+            const lineNum = offset + i + 1;
+            return (
+              <Box key={`L${lineNum}`} paddingLeft={1}>
+                <Text color="gray">{String(lineNum).padStart(lineNumWidth, ' ')} │ </Text>
+                <Text wrap="truncate-end">{line || ' '}</Text>
+              </Box>
+            );
+          })}
+          {visibleLines.length < viewerLines && Array.from({ length: viewerLines - visibleLines.length }, (_, i) => (
+            <Box key={`cpad-${i}`} paddingLeft={1}>
+              <Text color="gray">{' '.repeat(lineNumWidth)} │</Text>
+            </Box>
+          ))}
+        </>
+      )}
+      <Box paddingX={1}>
+        <Text dimColor>
+          {isFocused ? '↑↓ scroll · PgUp/PgDn half page · Esc back' : 'Tab to focus'}
+        </Text>
+      </Box>
+    </Box>
+  );
+}
+
+function GitPanel({
+  ws,
+  panelHeight,
+  isFocused,
+  gitCursor,
+}: {
+  ws: WorkspaceState;
+  panelHeight: number;
+  isFocused: boolean;
+  gitCursor: number;
+}) {
+  const listHeight = Math.max(1, panelHeight - 5); // border + header + stats + footer
+  const gitStart = Math.max(0, Math.min(gitCursor - Math.floor(listHeight / 2), Math.max(0, ws.gitFiles.length - listHeight)));
+  const visible = ws.gitFiles.slice(gitStart, gitStart + listHeight);
+
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor={isFocused ? 'cyan' : 'gray'}
+      overflow="hidden"
+      height={panelHeight}
+    >
+      <Box paddingX={1}>
+        <Text bold={isFocused} color={isFocused ? 'cyan' : 'gray'}>GIT</Text>
+        <Spacer />
+        <Text color="magenta">{ws.branch}</Text>
+      </Box>
+      <Box paddingX={1}>
+        <Text color="green">● {ws.stagedCount} staged</Text>
+        <Text color="gray"> · </Text>
+        <Text color="yellow">○ {ws.unstagedCount} unstaged</Text>
+      </Box>
+      {visible.length === 0 ? (
+        <Box paddingX={1}><Text dimColor>Clean working tree</Text></Box>
+      ) : (
+        visible.map((f, localIdx) => {
+          const idx = gitStart + localIdx;
+          const isSelected = idx === gitCursor;
+          return (
+            <Box key={f.path} paddingX={1}>
+              <Text
+                inverse={isSelected && isFocused}
+                color={isSelected ? 'white' : f.staged ? 'green' : 'yellow'}
+                wrap="truncate-end"
+              >
+                {isSelected ? '›' : ' '} {f.staged ? '●' : '○'} {f.status} {f.path}
+              </Text>
+            </Box>
+          );
+        })
+      )}
+      {visible.length < listHeight && Array.from({ length: listHeight - visible.length }, (_, i) => (
+        <Box key={`gpad-${i}`}><Text> </Text></Box>
+      ))}
+      <Box paddingX={1}>
+        <Text dimColor>{isFocused ? 'Enter stage/unstage · /ws commit <msg>' : 'Tab to focus'}</Text>
+      </Box>
+    </Box>
+  );
+}
+
+function AgentOutputPanel({
+  state,
+  panelHeight,
+  isFocused,
+  scrollOffset,
+  onScrollClamp,
+}: {
+  state: TuiState;
+  panelHeight: number;
+  isFocused: boolean;
+  scrollOffset: number;
+  onScrollClamp: (distance: number) => void;
+}) {
+  const viewLines = Math.max(1, panelHeight - 5 - (state.isThinking ? 1 : 0)); // border + header + status + footer
+
+  // Build a flat array of rendered lines from messages
+  const allLines: Array<{ key: string; node: React.ReactNode }> = [];
+
+  for (const msg of state.chatMessages) {
+    const roleColor = msg.role === 'user' ? 'yellow' : msg.role === 'system' ? 'gray' : 'cyan';
+    const prefix = msg.role === 'user' ? 'You' : msg.role === 'system' ? 'Sys' : state.agentName;
+    const contentLines = normalizeTerminalText(msg.content).split('\n');
+
+    // First line with role prefix
+    allLines.push({
+      key: `${msg.id}-0`,
+      node: (
+        <Box>
+          <Text color={roleColor} bold>{prefix}: </Text>
+          <Text wrap="truncate-end">{contentLines[0] || ''}</Text>
+        </Box>
+      ),
+    });
+
+    // Remaining lines indented
+    for (let i = 1; i < contentLines.length; i++) {
+      allLines.push({
+        key: `${msg.id}-${i}`,
+        node: (
+          <Box>
+            <Text> </Text>
+            <Text wrap="truncate-end" dimColor={msg.role === 'system'}>{contentLines[i]}</Text>
+          </Box>
+        ),
+      });
+    }
+
+    // Separator between messages
+    allLines.push({
+      key: `${msg.id}-sep`,
+      node: <Text dimColor>{'─'.repeat(3)}</Text>,
+    });
+  }
+
+  const totalLines = allLines.length;
+  const viewport = getViewportWindow(totalLines, viewLines, scrollOffset);
+  React.useEffect(() => {
+    if (viewport.distanceFromBottom !== scrollOffset) onScrollClamp(viewport.distanceFromBottom);
+  }, [onScrollClamp, scrollOffset, viewport.distanceFromBottom]);
+  const visibleLines = allLines.slice(viewport.start, viewport.end);
+  const hiddenAbove = viewport.start;
+  const hiddenBelow = Math.max(0, totalLines - viewport.end);
+
+  return (
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor={isFocused ? 'cyan' : 'gray'}
+      overflow="hidden"
+      height={panelHeight}
+    >
+      <Box paddingX={1}>
+        <Text bold={isFocused} color={isFocused ? 'cyan' : 'gray'}>AGENT OUTPUT</Text>
+        <Spacer />
+        <Text dimColor>{state.chatMessages.length} msg{state.chatMessages.length !== 1 ? 's' : ''}</Text>
+      </Box>
+      {visibleLines.length === 0 ? (
+        <Box flexDirection="column" flexGrow={1} alignItems="center" justifyContent="center">
+          <Text dimColor>No messages yet.</Text>
+          <Text dimColor>Type below to chat.</Text>
+        </Box>
+      ) : (
+        visibleLines.map((line) => (
+          <Box key={line.key} paddingX={1}>{line.node}</Box>
+        ))
+      )}
+      {/* Fill remaining space */}
+      {visibleLines.length > 0 && visibleLines.length < viewLines && (
+        Array.from({ length: viewLines - visibleLines.length }, (_, i) => (
+          <Box key={`apad-${i}`}><Text> </Text></Box>
+        ))
+      )}
+      {state.isThinking && (
+        <Box paddingX={1}>
+          <Text color="cyan">⠋ </Text>
+          <Text color="cyan" bold>{state.agentName}</Text>
+          <Text dimColor> · </Text>
+          <Text wrap="truncate-end">{(() => {
+            const running = [...state.toolSteps].reverse().find((s) => s.status === 'running');
+            return running ? running.label : 'Thinking...';
+          })()}</Text>
+        </Box>
+      )}
+      <Box paddingX={1} height={1}>
+        <Text dimColor>↑{hiddenAbove} · {viewport.start + (totalLines > 0 ? 1 : 0)}-{viewport.end}/{totalLines} · ↓{hiddenBelow}</Text>
+      </Box>
+      <Box paddingX={1}>
+        <Text dimColor>{isFocused ? '↑↓ · PgUp/PgDn · Home/End · Esc back' : 'Ctrl+J focus'}</Text>
+      </Box>
+    </Box>
+  );
+}
+
+function WorkspaceBody({ state, gitCursor, height, cols, onInput }: { state: TuiState; gitCursor: number; height: number; cols: number; onInput: (text: string) => void }) {
+  const ws = state.workspace;
+
+  if (!ws?.active) {
+    return (
+      <Box flexDirection="column" flexGrow={1} paddingX={1}>
+        <Text color="yellow">Workspace mode is not active.</Text>
+        <Text dimColor>Use /ws open &lt;path&gt; or type: open workspace /path/to/project</Text>
+      </Box>
+    );
+  }
+
+  const focusArea = ws.focusArea;
+  const rightPanel = ws.rightPanel;
+
+  const idePanelHeight = Math.max(4, height - 1); // tab bar occupies one row
+
+  // Column widths — 3 columns: explorer | code | right panel (chat or git)
+  let explorerWidth: number;
+  let rightWidth: number;
+
+  if (cols >= 140) {
+    explorerWidth = Math.floor(cols * 0.18);
+    rightWidth = Math.floor(cols * 0.28);
+  } else if (cols >= 120) {
+    explorerWidth = Math.floor(cols * 0.18);
+    rightWidth = Math.floor(cols * 0.26);
+  } else if (cols >= 100) {
+    explorerWidth = Math.floor(cols * 0.22);
+    rightWidth = Math.floor(cols * 0.28);
+  } else {
+    // Narrow: explorer + code only, no right panel
+    explorerWidth = Math.floor(cols * 0.30);
+    rightWidth = 0;
+  }
+
+  return (
+    <Box flexDirection="column" height={height} overflow="hidden">
+      <WorkspaceTabBar ws={ws} focusArea={focusArea} cols={cols} />
+      <Box flexDirection="row" height={idePanelHeight} overflow="hidden">
+        <Box width={explorerWidth}>
+          <ExplorerPanel
+            ws={ws}
+            panelHeight={idePanelHeight}
+            isFocused={focusArea === 'explorer'}
+          />
+        </Box>
+        <Box flexGrow={1}>
+          <CodeViewerPanel
+            ws={ws}
+            panelHeight={idePanelHeight}
+            isFocused={focusArea === 'code'}
+          />
+        </Box>
+        {rightWidth > 0 && (
+          <Box width={rightWidth}>
+            {rightPanel === 'chat' ? (
+              <AgentOutputPanel
+                state={state}
+                panelHeight={idePanelHeight}
+                isFocused={focusArea === 'chat'}
+                scrollOffset={ws.chatScrollOffset}
+                onScrollClamp={(distance) => onInput(`/ws chat-set ${distance}`)}
+              />
+            ) : (
+              <GitPanel
+                ws={ws}
+                panelHeight={idePanelHeight}
+                isFocused={focusArea === 'git'}
+                gitCursor={gitCursor}
+              />
+            )}
+          </Box>
+        )}
+      </Box>
+    </Box>
+  );
+}
+
+function MenuBody({ menuIdx }: { menuIdx: number }) {
+  const menuOptions: Array<{ label: string; mode: AppMode; icon: string }> = [
+    { label: 'Status', mode: 'menu', icon: '📊' },
+    { label: 'Coding Mode', mode: 'coding', icon: '💻' },
+    { label: 'Memory', mode: 'chat', icon: '🧠' },
+    { label: 'Spotify Player', mode: 'spotify', icon: '🎵' },
+    { label: 'Permissions', mode: 'chat', icon: '🔒' },
+    { label: 'Back to Chat', mode: 'chat', icon: '💬' },
+  ];
+
+  return (
+    <Box flexDirection="column" flexGrow={1} paddingX={1}>
+      <Text bold color="cyan">Menu</Text>
+      {menuOptions.map((opt, i) => (
+        <Box key={i}>
+          <Text>{i === menuIdx ? '●' : '·'} </Text>
+          <Text color={i === menuIdx ? 'cyan' : 'gray'}>{opt.icon} {opt.label}</Text>
+        </Box>
+      ))}
+      <Box marginTop={1}><Text dimColor>↑↓ navigate · Enter select · Esc back</Text></Box>
+    </Box>
+  );
+}
+
+function SpotifyBody({ activeIdx, nowPlaying, status, volume, albumArtAnsi }: { activeIdx: number; nowPlaying: string; status: string; volume: number | null; albumArtAnsi: string }) {
+  const volumeBar = volume == null
+    ? '[unknown]'
+    : `[${'█'.repeat(Math.max(0, Math.min(10, Math.round(volume / 10))))}${'░'.repeat(Math.max(0, 10 - Math.round(volume / 10)))}] ${volume}%`;
+  return (
+    <Box flexDirection="column" flexGrow={1} paddingX={1}>
+      <Box paddingX={1} marginBottom={1} flexDirection="column">
+        <Text color="green">╭────────────────── Spotify Deck ──────────────────╮</Text>
+        <Text color="green">│</Text><Text> </Text><Text bold color="green">Now Playing</Text>
+        {(nowPlaying || 'Nothing playing').split('\n').map((line, idx) => (
+          <Box key={`np-${idx}`}>
+            <Text color="green">│</Text><Text> </Text><Text>{line}</Text>
+          </Box>
+        ))}
+        <Box>
+          <Text color="green">│</Text><Text> </Text><Text color="yellow">Volume:</Text><Text> </Text><Text>{volumeBar}</Text>
+        </Box>
+        {albumArtAnsi ? (
+          <Box>
+            <Text color="green">│</Text><Text> </Text><Text>{albumArtAnsi}</Text>
+          </Box>
+        ) : null}
+        {status ? (
+          <Box>
+            <Text color="green">│</Text><Text> </Text><Text color="cyan">Last action:</Text><Text> </Text><Text>{status}</Text>
+          </Box>
+        ) : null}
+        <Text color="green">╰───────────────────────────────────────────────────╯</Text>
+      </Box>
+      <Box flexDirection="column">
+        <Text bold color="cyan">Controls</Text>
+        {PLAYER_CONTROLS.map((control, i) => (
+          <Box key={control.value}>
+            <Text>{i === activeIdx ? '●' : '·'} </Text>
+            <Text color={i === activeIdx ? 'green' : 'gray'}>{control.label}</Text>
+          </Box>
+        ))}
+      </Box>
+      <Box marginTop={1}>
+        <Text dimColor>↑↓ navigate · Enter select · N next · P previous · +/- volume · Z now playing · Esc exit</Text>
+      </Box>
+    </Box>
+  );
+}
+
+/**
+ * Throttled live tail of the streaming message (shared by chat, coding and
+ * Mercury Code). Recomputes at most every 120 ms while content grows, with
+ * a TRAILING flush: the frame after the last delta always repaints with
+ * the complete text (the old memo returned the stale cache and left the
+ * final chunk unrendered until something else re-rendered).
+ */
+function useThrottledStreamTail<T>(
+  message: ChatMessage | null | undefined,
+  compute: (message: ChatMessage) => T,
+  empty: T,
+  deps: readonly unknown[],
+): T {
+  const cacheRef = React.useRef<null | { id: string; at: number; contentLength: number; value: T; deps: readonly unknown[] }>(null);
+  const [, bump] = React.useReducer((n: number) => n + 1, 0);
+  const trailingRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  React.useEffect(() => () => { if (trailingRef.current) clearTimeout(trailingRef.current); }, []);
+  if (!message) {
+    cacheRef.current = null;
+    return empty;
+  }
+  const now = Date.now();
+  const cache = cacheRef.current;
+  const sameDeps = cache !== null && cache.deps.length === deps.length && cache.deps.every((d, i) => d === deps[i]);
+  if (cache && sameDeps && cache.id === message.id && cache.contentLength === message.content.length) return cache.value;
+  if (cache && sameDeps && cache.id === message.id && now - cache.at < STREAM_TAIL_THROTTLE_MS && cache.contentLength <= message.content.length) {
+    // Stale but inside the window: schedule the trailing repaint once.
+    if (!trailingRef.current) {
+      trailingRef.current = setTimeout(() => { trailingRef.current = null; bump(); }, STREAM_TAIL_THROTTLE_MS - (now - cache.at) + 1);
+    }
+    return cache.value;
+  }
+  const value = compute(message);
+  cacheRef.current = { id: message.id, at: now, contentLength: message.content.length, value, deps };
+  return value;
+}
+
+const STREAM_TAIL_THROTTLE_MS = 120;
+
+/**
+ * The streaming agent message in chat / coding mode. Renders only the
+ * fence-aligned tail of the buffer (buildStreamTailLines — the same
+ * renderer Mercury Code uses) instead of running renderMarkdown over the
+ * ENTIRE buffer on every delta, which was O(message) work per frame and
+ * the main reason long replies made the TUI crawl.
+ */
+function StreamingMessageTail({ message, agentName, maxLines, width }: { message: ChatMessage; agentName: string; maxLines: number; width: number }) {
+  const lines = useThrottledStreamTail(
+    message,
+    (m) => buildStreamTailLines(m, width, STREAM_TAIL_CHARS, maxLines, { showHeader: false }),
+    [] as MercuryTranscriptLine[],
+    [width, maxLines],
+  );
+  return (
+    <Box flexDirection="column" marginBottom={1} flexShrink={0}>
+      <Box flexShrink={0}>
+        <Text bold color="cyan">{agentName}:</Text>
+      </Box>
+      <Box flexDirection="column" flexShrink={0}>
+        {lines.map((line) => <MercuryTranscriptRow key={line.key} line={line} />)}
+      </Box>
+    </Box>
+  );
+}
+
+function StreamingMessagesView({ messages, agentName, maxLines, width }: { messages: ChatMessage[]; agentName: string; maxLines: number; width: number }) {
+  if (messages.length === 0) return null;
+  return (
+    <Box flexDirection="column" flexGrow={1} flexShrink={0} paddingX={1}>
+      {messages.slice(-3).map((msg) => (
+        <StreamingMessageTail key={msg.id} message={msg} agentName={agentName} maxLines={maxLines} width={width} />
+      ))}
+    </Box>
+  );
+}
+
+function ChatMessagesView({ messages, agentName, maxLines }: { messages: ChatMessage[]; agentName: string; maxLines?: number }) {
+  if (messages.length === 0) return null;
+
+  return (
+    <Box flexDirection="column" flexGrow={1} flexShrink={0} paddingX={1}>
+      {messages.slice(-50).map((msg) => (
+        <MessageRow key={msg.id} msg={msg} agentName={agentName} maxLines={maxLines} />
+      ))}
+    </Box>
+  );
+}
+
+/**
+ * Renders a single chat message (user / agent / system completion banner).
+ *
+ * `live` marks the currently-streaming message; it gets `flexShrink={0}` so
+ * Ink's Yoga layout never compresses its rows while deltas are arriving,
+ * which is what previously caused the visible "font shrink" + flicker.
+ */
+const MessageRow = React.memo(function MessageRow({
+  msg,
+  agentName,
+  maxLines,
+}: { msg: ChatMessage; agentName: string; maxLines?: number }) {
+  const isCompletion = msg.role === 'system' && msg.content.startsWith('━━━');
+  const roleColor = isCompletion
+    ? 'green'
+    : msg.role === 'user'
+      ? 'yellow'
+      : msg.role === 'system'
+        ? 'gray'
+        : 'cyan';
+  const prefix = msg.role === 'user' ? 'You' : msg.role === 'system' ? '' : agentName;
+
+  if (isCompletion) {
+    const meta = msg.completionMeta;
+    const formatTokens = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
+    return (
+      <Box key={msg.id} flexDirection="column" marginBottom={1} flexShrink={0}>
+        <Text color="green" bold>
+          {msg.content}
+        </Text>
+        {meta && (
+          <Box flexDirection="row" paddingLeft={2} flexShrink={0}>
+            <Text color="gray">☿ </Text>
+            <Text color="white" bold>
+              {meta.model}
+            </Text>
+            <Text color="gray"> via </Text>
+            <Text color="cyan">{meta.provider}</Text>
+            <Text color="gray"> · </Text>
+            <Text color="yellow">{formatTokens(meta.totalTokens)}</Text>
+            <Text color="gray"> tokens · Budget </Text>
+            {(() => {
+              const pct = Math.round(meta.budgetPercentage);
+              const barLen = 16;
+              const filled = Math.round((pct / 100) * barLen);
+              const barColor = pct >= 90 ? 'red' : pct >= 70 ? 'yellow' : 'green';
+              return (
+                <>
+                  <Text color={barColor}>{'█'.repeat(filled)}</Text>
+                  <Text color="gray">{'░'.repeat(barLen - filled)}</Text>
+                  <Text color={barColor}> {pct}%</Text>
+                </>
+              );
+            })()}
+          </Box>
+        )}
+      </Box>
+    );
+  }
+
+  const renderedLines = renderMarkdown(msg.content).split('\n');
+  const visibleLines = maxLines && renderedLines.length > maxLines
+    ? ['…', ...renderedLines.slice(-(maxLines - 1))]
+    : renderedLines;
+  return (
+    <Box key={msg.id} flexDirection="column" marginBottom={1} flexShrink={0}>
+      <Box flexShrink={0}>
+        <Text bold color={roleColor}>
+          {prefix}:
+        </Text>
+      </Box>
+      <Box marginLeft={2} flexDirection="column" flexShrink={0}>
+        {visibleLines.map((line, idx) => (
+          <Box key={`${msg.id}:${idx}`} flexShrink={0}>
+            <Text>{line.length > 0 ? line : ' '}</Text>
+          </Box>
+        ))}
+      </Box>
+    </Box>
+  );
+});
+
+/**
+ * Animated row for a currently-running tool step.
+ *
+ * Shows a braille spinner + live elapsed counter so the user gets
+ * continuous feedback during long operations (1-2 min tool calls
+ * like screenshots, large file ops, sub-agent dispatches).
+ *
+ * Color escalates to signal long runs:
+ *   < 30s : cyan       — normal
+ *   30-90s: yellow     — "still working" hint
+ *   > 90s : red        — long-op warning (mentions Ctrl+C)
+ */
+function RunningStepRow({ step }: { step: ToolStep }) {
+  // Shared 100 ms tick (tick-store.ts): one timer for every animated row.
+  const tick = useTick();
+  const frame = tick % SPINNER_FRAMES.length;
+  const startedAtRef = React.useRef(step.startedAt ?? Date.now());
+  if (step.startedAt) startedAtRef.current = step.startedAt;
+  const elapsed = elapsedSeconds(startedAtRef.current);
+
+  const tone = elapsed >= 90 ? 'red' : elapsed >= 30 ? 'yellow' : 'cyan';
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  const timeStr = mins > 0 ? `${mins}m${secs.toString().padStart(2, '0')}s` : `${secs}s`;
+
+  return (
+    <Box>
+      <Text color={tone}>{SPINNER_FRAMES[frame]}</Text>
+      <Text> </Text>
+      <Text color={tone} bold>{step.label}</Text>
+      <Text dimColor> · {timeStr}</Text>
+      {elapsed >= 30 && elapsed < 90 && <Text color="yellow" dimColor> · still working</Text>}
+      {elapsed >= 90 && <Text color="red" dimColor> · long op (/bg current to background, /stop to stop)</Text>}
+    </Box>
+  );
+}
+
+function ToolStepsView({ steps, viewMode, idle }: { steps: ToolStep[]; viewMode: 'balanced' | 'detailed'; idle?: boolean }) {
+  // When idle (task complete), show a single compact summary line.
+  // Full history is accessible via Ctrl+D (/log).
+  if (idle) {
+    const last = [...steps].reverse().find((s) => s.status === 'done' || s.status === 'error') ?? steps[steps.length - 1];
+    if (!last) return null;
+    const totalDone = steps.filter((s) => s.status === 'done').length;
+    const icon = last.status === 'done' ? '✓' : last.status === 'error' ? '✗' : '·';
+    const more = totalDone > 1 ? ` (+${totalDone - 1})` : '';
+    return (
+      <Box marginLeft={2} marginTop={1}>
+        <Text dimColor>{icon} {last.label}{more} · Ctrl+D for details</Text>
+      </Box>
+    );
+  }
+
+  // Active: show at most 3 visible steps (running + last 2 done).
+  // All other steps are collapsed into "N earlier" — no scrolling list.
+  const MAX_VISIBLE = 3;
+  const totalDone = steps.filter((s) => s.status === 'done').length;
+  const doneSteps = steps.filter((s) => s.status === 'done');
+  const runningSteps = steps.filter((s) => s.status === 'running');
+  const hiddenCount = Math.max(0, steps.length - MAX_VISIBLE);
+  const visible = [
+    ...doneSteps.slice(-(MAX_VISIBLE - runningSteps.length)),
+    ...runningSteps,
+  ].slice(-MAX_VISIBLE);
+
+  return (
+    <Box flexDirection="column" marginLeft={2} marginTop={1}>
+      <Box>
+        <Text color="gray" bold>⏳</Text>
+        <Text color="gray"> {totalDone} done{runningSteps.length > 0 ? `, ${runningSteps.length} running` : ''}</Text>
+        {hiddenCount > 0 && <Text dimColor> · {hiddenCount} earlier</Text>}
+      </Box>
+      {visible.map((step) => {
+        if (step.status === 'running') {
+          return <RunningStepRow key={step.id} step={step} />;
+        }
+        return (
+          <Box key={step.id}>
+            <Text color="green">✓</Text>
+            <Text dimColor> {step.label}</Text>
+            {step.elapsed != null && <Text dimColor> ({step.elapsed.toFixed(1)}s)</Text>}
+          </Box>
+        );
+      })}
+    </Box>
+  );
+}
+
+function ThinkingIndicator({ agentName, steps, mode, liveActivity, thinkingPreview, frozen, title, longOpHint }: { agentName: string; steps: ToolStep[]; mode: AppMode; liveActivity?: LiveActivityState | null; thinkingPreview?: string | null; frozen?: boolean; title?: string; longOpHint?: boolean }) {
+  const frames = SPINNER_FRAMES;
+  const startRef = React.useRef(Date.now());
+  // Shared 100 ms tick. Scroll lock: an unsubscribed (frozen) indicator
+  // commits no frames at all.
+  const frame = useTick(!frozen) % frames.length;
+  const elapsed = elapsedSeconds(startRef.current);
+
+  const spinner = frames[frame];
+  const runningStep = [...steps].reverse().find((s) => s.status === 'running');
+  const doneSteps = steps.filter((s) => s.status === 'done');
+  const totalSteps = steps.length;
+
+  // Live activity (provider/phase) outranks the generic label — the user
+  // must see WHO the response is being waited on, not just "Composing".
+  const currentAction = runningStep
+    ? runningStep.label
+    : liveActivity?.phase
+      ? `${liveActivity.phase}${liveActivity.detail ? ` — ${liveActivity.detail}` : ''}`
+      : thinkingPreview
+        ? 'Thinking...'
+        : (mode === 'coding' || mode === 'workspace') ? 'Analyzing code' : 'Composing response';
+
+  const displayElapsed = runningStep?.startedAt
+    ? elapsedSeconds(runningStep.startedAt)
+    : elapsed;
+  const actionTone = displayElapsed >= 90 ? 'red' : displayElapsed >= 30 ? 'yellow' : 'white';
+
+  const mins = Math.floor(displayElapsed / 60);
+  const secs = displayElapsed % 60;
+  const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+
+  // Show at most 2 most recent completed steps (keeps total lines ≤ 3)
+  const recentDone = doneSteps.slice(-2);
+  const thinkLine = !runningStep && thinkingPreview ? thinkingPreview.slice(-120) : null;
+
+  return (
+    <Box marginTop={1} marginLeft={2} flexDirection="column">
+      <Box>
+        <Text color={actionTone === 'white' ? 'cyan' : actionTone}>{spinner}</Text>
+        <Text> </Text>
+        <Text color="cyan" bold>{title ?? 'Processing'}</Text>
+        <Text dimColor>{totalSteps > 0 ? ` · step ${totalSteps} · ${timeStr}` : ` · ${timeStr}`}</Text>
+      </Box>
+      <Box marginLeft={4}>
+        <Text color={actionTone} bold>{currentAction}</Text>
+        {/* The /bg·/stop hint is main-agent only — bot threads have their own
+            controls, and long tasks are the norm for bots. */}
+        {(longOpHint ?? true) && displayElapsed >= 90 && <Text color="red" dimColor> · long op (/bg current to background, /stop to stop)</Text>}
+      </Box>
+      {thinkLine && (
+        <Box marginLeft={4}>
+          <Text dimColor>  “{thinkLine}”</Text>
+        </Box>
+      )}
+      {recentDone.length > 0 && (
+        <Box flexDirection="column" marginLeft={4} marginTop={0}>
+          {recentDone.map((step) => (
+            <Box key={step.id}>
+              <Text color="green">✓</Text>
+              <Text dimColor> {step.label}</Text>
+              {step.elapsed != null && <Text dimColor> ({step.elapsed.toFixed(1)}s)</Text>}
+            </Box>
+          ))}
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+/**
+ * Fleet live region for an open bot thread: what this bot is doing RIGHT
+ * NOW, and — for a lead — exactly which sub-bot is doing what, recursively
+ * (CEO → Eng Lead → Backend). One self-ticker drives all rows; the rows
+ * also refresh on every activity event.
+ */
+function BotFleetLiveRegion({ botId, botName, botLiveActivity, botStreamTails, botRoster }: {
+  botId: string;
+  botName: string;
+  botLiveActivity: Record<string, LiveActivityState>;
+  botStreamTails: Record<string, { reasoning: string; text: string }>;
+  botRoster: Array<{ id: string; name: string; state: string; fleetRole?: 'lead' | 'crew'; parent?: string }>;
+}) {
+  const own = botLiveActivity[botId];
+  const crew = botRoster.filter(b => b.parent === botId);
+  const crewLive = crew.filter(c => botLiveActivity[c.id]);
+  const ownTail = botStreamTails[botId];
+  const visible = Boolean(own || crewLive.length > 0 || ownTail);
+  // Shared 100 ms tick; subscribed only while there is something to animate.
+  const tick = useTick(visible);
+  if (!visible) return null;
+
+  const frames = SPINNER_FRAMES;
+
+  const row = (id: string, name: string, label: string, indent: string): React.ReactNode => {
+    return (
+      <Box key={id}>
+        <Text>{indent}</Text>
+        <Text color="cyan">{frames[tick % frames.length]}</Text>
+        <Text bold> {name} ({id})</Text>
+        <Text dimColor> · {label}</Text>
+      </Box>
+    );
+  };
+
+  const renderCrewTree = (leadId: string, depth: number): React.ReactNode[] => {
+    const out: React.ReactNode[] = [];
+    for (const member of botRoster.filter(b => b.parent === leadId)) {
+      const act = botLiveActivity[member.id];
+      if (act) out.push(row(member.id, member.name, act.detail || act.phase, '  '.repeat(depth)));
+      out.push(...renderCrewTree(member.id, depth + 1));
+    }
+    return out;
+  };
+
+  // What the open bot is THINKING — the streaming tails from its turn's
+  // provider deltas (reasoning first, then any reply text being composed).
+  const tailSegment = (text: string, kind: 'reasoning' | 'reply'): React.ReactNode[] => {
+    const lines = text.replace(/\n+$/, '').split('\n').slice(-BOT_TAIL_MAX_ROWS);
+    return lines.map((line, idx) => (
+      <Box key={`${kind}:${idx}`} marginLeft={6}>
+        <Text dimColor={kind === 'reasoning'}>{kind === 'reasoning' ? `  ${line}` : line}</Text>
+      </Box>
+    ));
+  };
+  const openTail = ownTail ? [
+    ...tailSegment(ownTail.reasoning.trim(), 'reasoning'),
+    ...tailSegment(ownTail.text.trim(), 'reply'),
+  ] : [];
+
+  return (
+    <Box marginTop={1} marginLeft={4} flexDirection="column">
+      {openTail.length > 0 && (
+        <Box flexDirection="column" marginBottom={1}>
+          {openTail}
+        </Box>
+      )}
+      {own && row(botId, botName, own.detail || own.phase, '')}
+      {crewLive.length > 0 && <Text dimColor>  └ crew working ({crewLive.length}):</Text>}
+      {renderCrewTree(botId, 1)}
+    </Box>
+  );
+}
+
+function AgentPanelView({ agents, cols }: { agents: SubAgentInfo[]; cols: number }) {
+  if (agents.length === 0) return null;
+  return (
+    <Box flexDirection="column" marginTop={1} paddingX={1}>
+      <Text color="gray">{'─'.repeat(ruleWidth(cols, 30))}</Text>
+      <Text bold color="cyan">Agents</Text>
+      {agents.map((agent) => {
+        const cfg = STATUS_ICONS[agent.status] || STATUS_ICONS.pending;
+        const elapsed = ((Date.now() - agent.startedAt) / 1000).toFixed(0);
+        const taskPreview = agent.task.length > 40 ? agent.task.slice(0, 37) + '...' : agent.task;
+        return (
+          <Box key={agent.id} flexDirection="column">
+            <Box><Text>{cfg.icon} </Text><Text bold color={cfg.color}>{agent.id}</Text><Text dimColor> {taskPreview}</Text></Box>
+            <Box marginLeft={3}><Text dimColor>{agent.status} · {elapsed}s</Text></Box>
+          </Box>
+        );
+      })}
+    </Box>
+  );
+}
+
+function SidebarView({ sections }: { sections: SidebarSection[] }) {
+  if (sections.length === 0) return null;
+  return (
+    <Box flexDirection="column" width={24} paddingX={1}>
+      <Text color="gray">{'─'.repeat(22)}</Text>
+      {sections.map((section, si) => (
+        <Box key={si} flexDirection="column" marginBottom={si < sections.length - 1 ? 1 : 0}>
+          <Text bold color="cyan">{section.title}</Text>
+          {section.items.map((item, ii) => (
+            <Box key={ii}><Text>{item.icon} </Text><Text color={item.active ? 'white' : 'gray'}>{item.label}</Text></Box>
+          ))}
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+export function PermPromptView({ prompt, activeIdx }: { prompt: PermissionPromptState; activeIdx: number }) {
+  const options = prompt.options || [];
+
+  if (options.length > 0) {
+    const hasAlways = options.some((opt) => opt.value === 'always');
+    return (
+      <Box flexDirection="column" marginTop={1} paddingX={1}>
+        <Box><Text bold color="yellow">⚠ {prompt.message}</Text></Box>
+        {options.map((opt, i) => (
+          <Box key={opt.value}>
+            <Text>{i === activeIdx ? '●' : '·'} </Text>
+            <Text color={i === activeIdx ? 'cyan' : 'gray'}>{opt.label}</Text>
+          </Box>
+        ))}
+        <Text dimColor>{hasAlways ? '  ↑↓ choose · Enter confirm · Y/N/A shortcuts · Esc cancel' : '  ↑↓ choose · Enter confirm · Y/N shortcuts · Esc cancel'}</Text>
+      </Box>
+    );
+  }
+
+  if (prompt.type === 'continue') {
+    return (
+      <Box flexDirection="column" marginTop={1} paddingX={1}>
+        <Box><Text color="yellow">⚠ </Text><Text>{prompt.message}</Text></Box>
+        <Text dimColor>  [y/N]</Text>
+      </Box>
+    );
+  }
+
+  if (prompt.type === 'ask') {
+    return (
+      <Box flexDirection="column" marginTop={1} paddingX={1}>
+        <Box><Text color="yellow">⚠ </Text><Text>{prompt.message}</Text></Box>
+        <Text dimColor>  Type your answer and press Enter</Text>
+      </Box>
+    );
+  }
+
+  return (
+    <Box flexDirection="column" marginTop={1} paddingX={1}>
+      <Box><Text bold color="yellow">⚠ {prompt.message}</Text></Box>
+      {options.map((opt, i) => (
+        <Box key={opt.value}>
+          <Text>{i === activeIdx ? '●' : '·'} </Text>
+          <Text color={i === activeIdx ? 'cyan' : 'gray'}>{opt.label}</Text>
+        </Box>
+      ))}
+      <Text dimColor>  ↑↓ to navigate, Enter to select</Text>
+    </Box>
+  );
+}
+
+function InputBox({
+  input,
+  cursorPos,
+  mode,
+  programmingMode,
+  projectContext,
+  botChat,
+  botsWorking,
+  turnRunning,
+  ctrlCHint,
+  cursorActive = true,
+  cols = 80,
+}: {
+  input: string;
+  cursorPos: number;
+  mode: AppMode;
+  programmingMode: ProgrammingModeState;
+  projectContext: string | null;
+  botChat?: { botId: string; botName: string } | null;
+  /** Bots currently running a turn (live roster, polled every 2s). */
+  botsWorking?: number;
+  /** A turn is in flight: the hint row offers Esc to interrupt. */
+  turnRunning?: boolean;
+  /** Ctrl+C exit armed: show the second-tap hint. */
+  ctrlCHint?: boolean;
+  /** The composer owns the keyboard: park the hardware cursor on its cell. */
+  cursorActive?: boolean;
+  /** Terminal width: every chrome row is fitted to it (never wraps). */
+  cols?: number;
+}) {
+  const inWorkspace = mode === 'workspace';
+  const inCoding = mode === 'coding' || inWorkspace;
+  const promptColor = botChat ? 'magenta' : inWorkspace ? 'cyan' : inCoding ? 'green' : 'yellow';
+  const label = botChat ? `[BOT ${botChat.botId}]` : inWorkspace ? '[IDE CHAT]' : inCoding ? '[CODING]' : '[CHAT]';
+  // Header row budget: label + " mode=EXECUTE" + bots chip; the context
+  // label gets what is left (and disappears first when narrow).
+  const modeText = `mode=${programmingMode.toUpperCase()}`;
+  const botsText = botsWorking && botsWorking > 0 ? ` 🤖 ${botsWorking} working` : '';
+  const contextBudget = Math.min(52, cols - 2 - label.length - 2 - modeText.length - 1 - botsText.length - 2);
+  const contextLabel = contextBudget >= 8 ? fitTail(projectContext || 'No project context', contextBudget) : '';
+  const narrow = isNarrow(cols);
+  const hint = ctrlCHint
+    ? CTRL_C_EXIT_HINT
+    : turnRunning
+      ? (narrow ? 'Esc stop · Ctrl+C clear' : 'Esc interrupt · Ctrl+C clear input')
+      : inWorkspace
+        ? (narrow ? 'Tab panels · Esc exit' : 'Tab switch panels · Ctrl+J chat · Ctrl+P Plan · Ctrl+X Execute · Esc back/exit')
+        : inCoding
+          ? (narrow ? 'Ctrl+P Plan · Ctrl+X Exec' : 'Coding chat active. Ctrl+P Plan · Ctrl+X Execute.')
+          : (narrow ? 'Enter send · /help keys' : 'Enter send · Shift+Enter/Ctrl+N newline · Ctrl+C clear · /help keys');
+
+  // Split input into lines and figure out which line/col the cursor is on
+  const lines = input.split('\n');
+  let cursorLine = 0;
+  let cursorCol = cursorPos;
+  let consumed = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (consumed + lines[i].length >= cursorPos && i < lines.length - 1 ? consumed + lines[i].length + 1 > cursorPos : true) {
+      cursorLine = i;
+      cursorCol = cursorPos - consumed;
+      break;
+    }
+    consumed += lines[i].length + 1; // +1 for \n
+  }
+
+  return (
+    <Box flexDirection="column">
+      <Text color="dim">{'─'.repeat(ruleWidth(cols, 60, 0))}</Text>
+      <Box paddingX={1} height={1} overflow="hidden">
+        <Text color={promptColor} bold>{label}</Text>
+        <Text dimColor>{contextLabel ? ` ${contextLabel} ` : ' '}</Text>
+        <Text color={programmingMode === 'execute' ? 'green' : programmingMode === 'plan' ? 'yellow' : 'gray'}>
+          mode={programmingMode.toUpperCase()}
+        </Text>
+        {/* Ambient bot-fleet status: shown ONLY while bots are actually
+            working (idle = nothing rendered, no "idle" noise). */}
+        {botsWorking && botsWorking > 0 ? (
+          <Text color="magenta"> 🤖 {botsWorking} working</Text>
+        ) : null}
+      </Box>
+      <Box paddingX={1} flexDirection="column">
+        {lines.map((line, i) => (
+          <Box key={i}>
+            <Text color={promptColor} bold>{i === 0 ? '> ' : '  '}</Text>
+            {i === cursorLine ? (
+              <>
+                <Text>{expandTabs(line.slice(0, cursorCol))}</Text>
+                <CursorCell glyph={cursorCol < line.length ? expandTabs(graphemeAt(line, cursorCol)) : ' '} active={cursorActive} />
+                <Text>{cursorCol < line.length ? expandTabs(line.slice(nextGraphemeBoundary(line, cursorCol))) : ''}</Text>
+              </>
+            ) : (
+              <Text>{expandTabs(line)}</Text>
+            )}
+          </Box>
+        ))}
+      </Box>
+      <Box paddingX={1} height={1} overflow="hidden">
+        {ctrlCHint
+          ? <Text color="yellow" wrap="truncate-end">{hint}</Text>
+          : <Text dimColor wrap="truncate-end">{hint}</Text>}
+      </Box>
+    </Box>
+  );
+}
+
+// ─── Mercury Code (full-screen /code) ───────────────────────────────────────
+
+const CODE_HINTS: Array<[string, string, string]> = [
+  ['/code auto', 'plan & build automatically — the default', ''],
+  ['/code plan', 'analyze & propose before coding', 'ctrl+p'],
+  ['/code execute', 'approve & implement the plan', 'ctrl+x'],
+  ['/init', 'scan repo & write AGENTS.md', ''],
+  ['/code diff', 'show working-tree diff', 'ctrl+g'],
+  ['/code expand', 'show full output of the last tool', 'ctrl+o'],
+  ['/code freeze', 'freeze frames to scroll/copy freely', 'ctrl+s'],
+  ['/code chat', 'switch back to regular chat', 'esc esc'],
+  ['/code exit', 'leave Mercury Code (confirm)', 'ctrl+d'],
+];
+
+/** Compact live plan checklist: which step is being implemented, what's done. */
+function PlanProgressView({ steps }: { steps: PlanStep[] }): React.ReactNode {
+  const done = steps.filter((s) => s.status === 'done');
+  const active = steps.find((s) => s.status === 'active');
+  const pending = steps.filter((s) => s.status === 'pending');
+  const MAX_ROWS = 6;
+  const rows: React.ReactNode[] = [];
+
+  // Recent done steps (collapsed if many), the active step, then pending.
+  const recentDone = done.slice(-2);
+  const hiddenDone = done.length - recentDone.length;
+  if (hiddenDone > 0) {
+    rows.push(
+      <Box key="done-summary">
+        <Text color="green">☑</Text><Text dimColor> {hiddenDone} earlier step{hiddenDone === 1 ? '' : 's'} completed</Text>
+      </Box>,
+    );
+  }
+  for (const s of recentDone) {
+    rows.push(
+      <Box key={`d:${s.label}`}><Text color="green">☑</Text><Text dimColor> {s.label}</Text></Box>,
+    );
+  }
+  if (active) {
+    rows.push(
+      <Box key="active"><Text color={THEME_ACCENT} bold>▶ </Text><Text color={THEME_ACCENT} bold>{active.label}</Text><Text dimColor>  ← implementing</Text></Box>,
+    );
+  }
+  const pendingRoom = Math.max(0, MAX_ROWS - rows.length);
+  for (const s of pending.slice(0, pendingRoom)) {
+    rows.push(<Box key={`p:${s.label}`}><Text dimColor>☐</Text><Text dimColor> {s.label}</Text></Box>);
+  }
+  if (pending.length > pendingRoom) {
+    rows.push(<Box key="more"><Text dimColor>… {pending.length - pendingRoom} more pending</Text></Box>);
+  }
+
+  return (
+    <Box flexDirection="column" paddingX={2} flexShrink={0}>
+      {rows}
+    </Box>
+  );
+}
+
+/** Live streaming tail budget: chars of the stream buffer rendered per frame. */
+const STREAM_TAIL_CHARS = 32 * 1024;
+/** Live bot-thinking tail cap (rows) in an open bot thread. */
+const BOT_TAIL_MAX_ROWS = 8;
+const STREAM_TAIL_MIN_LINES = 6;
+/** Absolute ceiling on live tail rows: bounds per-frame markdown + highlight
+ * work regardless of terminal height. */
+const STREAM_TAIL_MAX_LINES = 48;
+/** Live-region chrome below the tail block: input box (2 borders + lines),
+ * status bar, live-feedback block (≤5), plan checklist (≤6), prompts. Kept in
+ * sync with MercuryCodeView's render tree. */
+const MERCURY_CODE_LIVE_CHROME_ROWS = 14;
+
+/**
+ * Extra rows of headroom under the terminal height. MERCURY_CODE_LIVE_CHROME_ROWS
+ * is an estimate: MercuryLiveFeedback alone can render ~10 rows (phase, running
+ * tool, done ticks, thinking preview, up to 4 swarm agents) and prompts/checklists
+ * stack on top. If the live region reaches `rows`, stock ink used to clear the
+ * whole terminal (scrollback included) and re-dump the transcript every frame —
+ * the patched ink now bottom-trims the frame instead, but the goal is to never
+ * need the trim, so the tail cap keeps real chrome strictly under `rows`.
+ */
+const LIVE_HEIGHT_SAFETY_MARGIN = 2;
+
+/**
+ * Live streaming tail row cap, derived from the terminal height. The cap must
+ * keep the live region strictly under `rows`: ink's overflow path rewrites the
+ * whole terminal whenever `outputHeight >= stdout.rows`, and with a long
+ * conversation that re-dump is enormous. Diff-render makes per-frame writes
+ * cheap, so the cap stays generous; the ink-level guard is the backstop when
+ * transient chrome (prompts, plan checklist) pushes the region over.
+ */
+export function streamTailRowCap(terminalRows: number): number {
+  return Math.max(
+    STREAM_TAIL_MIN_LINES,
+    Math.min(STREAM_TAIL_MAX_LINES, terminalRows - MERCURY_CODE_LIVE_CHROME_ROWS - LIVE_HEIGHT_SAFETY_MARGIN),
+  );
+}
+
+/**
+ * Vibrant Mercury palette for the wordmark. Background-adaptive: on a dark
+ * terminal cyan "MERCURY" contrasts with orange "CODE"; on a light
+ * background the shades deepen instead of washing out.
+ */
+// One solid color per word, background-adaptive. "CODE" is a whitish gray
+// on dark (a dark gray on light — whitish would vanish on white) so the
+// "MERCURY" accent stays the visual anchor on any background.
+const WORDMARK_COLORS = IS_LIGHT_TERMINAL
+  ? { mercury: 'blue', code: '#5f6368' }
+  : { mercury: 'cyanBright', code: '#c9cdd4' };
+
+/** Accent for the Mercury Code transcript: cyan is faint on a light background. */
+const THEME_ACCENT = IS_LIGHT_TERMINAL ? 'blue' : 'cyan';
+
+/** Centered three-column hint block (command · description · key), opencode-style. */
+function MercuryCodeHints({ cols }: { cols: number }): React.ReactNode {
+  const cmdW = Math.max(...CODE_HINTS.map((h) => h[0].length));
+  const descW = Math.max(...CODE_HINTS.map((h) => h[1].length));
+  const keyW = Math.max(...CODE_HINTS.map((h) => h[2].length));
+  // Drop the description column (then the key column) rather than wrap.
+  const fit = hintColumns(cols, cmdW, descW, keyW);
+  const rowLen = cmdW + (fit.desc ? 2 + descW : 0) + (fit.key ? 2 + keyW : 0);
+  const indent = Math.max(0, Math.floor((cols - rowLen) / 2));
+  return (
+    <Box flexDirection="column" alignItems="flex-start" paddingLeft={indent} marginTop={2}>
+      {CODE_HINTS.map(([cmd, desc, key]) => (
+        <Box key={cmd}>
+          <Text bold color={THEME_ACCENT}>{cmd.padEnd(cmdW)}</Text>
+          {fit.desc && <Text>  </Text>}
+          {fit.desc && <Text dimColor>{desc.padEnd(descW)}</Text>}
+          {fit.key && <Text>  </Text>}
+          {fit.key && <Text color="blue">{key}</Text>}
+        </Box>
+      ))}
+    </Box>
+  );
+}
+
+/** Single active live-feedback block: phase + elapsed + running tool + done ticks + swarm. */
+function MercuryLiveFeedback({ state }: { state: TuiState }): React.ReactNode {
+  const frames = SPINNER_FRAMES;
+  // Finished steps are not repeated here: each one is already a block in
+  // the transcript above (tool-block.ts). Only live work shows.
+  const running = [...state.toolSteps].reverse().find((s) => s.status === 'running');
+  const activeAgents = state.subAgents.filter((a) => a.status === 'running' || a.status === 'paused');
+  const activity = state.liveActivity;
+  const active = Boolean(running || state.isThinking || activeAgents.length > 0 || activity);
+  // Shared 100 ms tick: smooth spinner AND a live seconds counter. Scroll
+  // lock: a frozen screen is not subscribed, so no frame is committed.
+  const forceTick = useTick(active && state.mode === 'mercury-code' && !state.tuiFrozen);
+  const frame = forceTick % frames.length;
+
+  // "Did you know?" tip row: after a minute of a running task, ONE dim tip
+  // appears and its content rotates a couple of times — the row's height is
+  // fixed for the whole stream (truncated), so no scrollback churn.
+  const [tipText, setTipText] = React.useState<string | null>(null);
+  const tipShownAtRef = React.useRef<number>(0);
+  const tipRotationsRef = React.useRef<number>(0);
+  React.useEffect(() => {
+    if (!active || state.mode !== 'mercury-code' || state.tuiFrozen) return;
+    if (!activity?.startedAt || tipText != null) return;
+    if (Date.now() - activity.startedAt < 60_000) return;
+    const tip = rotateTip('code');
+    if (tip) {
+      tipShownAtRef.current = Date.now();
+      setTipText(tip.tip);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- activity identity churns; startedAt is the meaningful dep
+  }, [active, state.mode, state.tuiFrozen, activity?.startedAt, forceTick]);
+  React.useEffect(() => {
+    if (!tipText || tipRotationsRef.current >= 2) return;
+    const t = setInterval(() => {
+      tipRotationsRef.current += 1;
+      const next = rotateTip('code');
+      if (next) setTipText(next.tip);
+      if (tipRotationsRef.current >= 3) clearInterval(t);
+    }, 15_000);
+    return () => clearInterval(t);
+  }, [tipText]);
+  if (state.mode !== 'mercury-code') return null;
+  if (!active) return null;
+
+  const elapsedSec = activity ? Math.floor((Date.now() - activity.startedAt) / 1000) : 0;
+  const mins = Math.floor(elapsedSec / 60);
+  const secs = elapsedSec % 60;
+  const timeStr = mins > 0 ? `${mins}m${String(secs).padStart(2, '0')}s` : `${secs}s`;
+  // Status word: Mercury Code's live status row. Session start has no
+  // persona yet, so it shows the plain static label; once the agent's
+  // one-shot LLM refinement lands (statusVerbs), the row rotates verbs
+  // written for THIS project's actual work. Informative phases (provider
+  // calls, real tool labels) always win over any of these.
+  const tick = Date.now();
+  const statusWord = state.programmingMode === 'plan'
+    ? PLANNING_VERBS[Math.floor(tick / 12_000) % PLANNING_VERBS.length]
+    : state.statusVerbs && state.statusVerbs.length > 0
+      ? pickStatusWord({ userText: lastUserText(state.chatMessages), dynamicVerbs: state.statusVerbs }, tick)
+      : 'Working';
+  const phase = (activity?.phase && !GENERIC_PHASES.has(activity.phase) ? activity.phase : null)
+    ?? (running
+      ? running.label
+      : state.isThinking
+        ? statusWord
+        : null);
+  const detail = activity?.detail ?? null;
+  const stepsDone = activity?.stepsDone ?? 0;
+
+  return (
+    <Box flexDirection="column" paddingX={2} flexShrink={0}>
+      {phase && (
+        <Box>
+          <Text color={THEME_ACCENT}>{frames[frame]}</Text>
+          <Text> </Text>
+          <Text color={THEME_ACCENT} bold>{phase}</Text>
+          {stepsDone > 0 && <Text dimColor> · step {stepsDone}</Text>}
+          <Text dimColor> · {timeStr}</Text>
+          {detail && <Text dimColor> — {detail}</Text>}
+          {/* No long-op hint here: Mercury Code tasks are long by design —
+              the hint is noise in the coding TUI. It stays on the chat
+              surfaces, where a long foreground op is the exception. */}
+        </Box>
+      )}
+      {running && (
+        <Box paddingLeft={2}>
+          <Text color="yellow">→ {running.label}</Text>
+          {running.startedAt && <Text dimColor> ({Math.max(0, (Date.now() - running.startedAt) / 1000).toFixed(0)}s)</Text>}
+        </Box>
+      )}
+      {!running && state.thinkingPreview && (
+        <Box paddingLeft={2}>
+          <Text dimColor>  “{state.thinkingPreview.slice(-120)}”</Text>
+        </Box>
+      )}
+      {tipText && (
+        <Box paddingLeft={2}>
+          <Text dimColor wrap="truncate-end">💡 Did you know? {tipText}</Text>
+        </Box>
+      )}
+      {activeAgents.length > 0 && (
+        <React.Fragment>
+          <Text color="magenta">  ⧖ swarm · {activeAgents.length} in parallel</Text>
+          {activeAgents.slice(0, 4).map((a) => (
+            <Box key={a.id}>
+              <Text color="magenta">  {frames[(frame + a.id.length) % frames.length]}</Text>
+              <Text> </Text>
+              <Text color="magenta" bold>{a.id}</Text>
+              <Text dimColor> {a.task.length > 44 ? a.task.slice(0, 41) + '…' : a.task}</Text>
+            </Box>
+          ))}
+        </React.Fragment>
+      )}
+    </Box>
+  );
+}
+
+/** Bordered input box (opencode-style) with mode-tinted prompt. */
+function MercuryCodeInput({ input, cursorPos, mode, boxWidth, cursorActive = true }: { input: string; cursorPos: number; mode: ProgrammingModeState; boxWidth: number; cursorActive?: boolean }) {
+  const color = mode === 'execute' ? 'green' : mode === 'plan' ? 'yellow' : THEME_ACCENT;
+  const lines = input.split('\n');
+  let cursorLine = 0;
+  let cursorCol = cursorPos;
+  let consumed = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (consumed + lines[i].length >= cursorPos || i === lines.length - 1) {
+      cursorLine = i;
+      cursorCol = cursorPos - consumed;
+      break;
+    }
+    consumed += lines[i].length + 1;
+  }
+
+  return (
+    <Box paddingX={2} flexShrink={0}>
+      <Box borderStyle="round" borderColor="gray" flexDirection="column" width={boxWidth} paddingX={1}>
+        {lines.map((line, i) => (
+          <Box key={i}>
+            <Text bold color={color}>{i === 0 ? '> ' : '  '}</Text>
+            {i === cursorLine ? (
+              <>
+                <Text>{expandTabs(line.slice(0, cursorCol))}</Text>
+                <CursorCell glyph={cursorCol < line.length ? expandTabs(graphemeAt(line, cursorCol)) : ' '} active={cursorActive} />
+                <Text>{cursorCol < line.length ? expandTabs(line.slice(nextGraphemeBoundary(line, cursorCol))) : ''}</Text>
+              </>
+            ) : (
+              <Text>{expandTabs(line)}</Text>
+            )}
+          </Box>
+        ))}
+      </Box>
+    </Box>
+  );
+}
+
+function MercuryCodeExitConfirm({ boxWidth }: { boxWidth: number }): React.ReactNode {
+  return (
+    <Box paddingX={2} flexShrink={0}>
+      <Box borderStyle="round" borderColor="yellow" width={boxWidth} paddingX={1}>
+        <Text color="yellow" bold>Exit Mercury Code? </Text>
+        <Text dimColor>Enter/Y exit · Esc/N stay · Ctrl+D force</Text>
+      </Box>
+    </Box>
+  );
+}
+
+/**
+ * Static-output item key for the Mercury Code brand block: printed once when
+ * Mercury Code mounts, then it lives in terminal scrollback like any other
+ * transcript row (native scrollback model — same as ChatBody above).
+ */
+const MERCURY_BRAND_ITEM_KEY = '__mercury_code_brand__';
+
+/** One formatted transcript row (shared by the brand block, Static items, and the live stream tail). */
+function MercuryTranscriptRow({ line }: { line: MercuryTranscriptLine }): React.ReactNode {
+  if (line.kind === 'brand') {
+    // Indent is baked into the text for exact centering.
+    return (
+      <Box>
+        {line.accent && line.accent.length > 0 ? (
+          <>
+            <Text bold color={WORDMARK_COLORS.mercury}>{line.text}</Text>
+            <Text bold color={WORDMARK_COLORS.code}>{line.accent}</Text>
+          </>
+        ) : (
+          <Text bold color={THEME_ACCENT}>{line.text}</Text>
+        )}
+      </Box>
+    );
+  }
+  if (line.kind === 'spacer') {
+    return <Box paddingX={2}><Text> </Text></Box>;
+  }
+  if (line.kind === 'system') {
+    const complete = line.text.startsWith('Task complete');
+    return (
+      <Box paddingX={2}>
+        <Text color={complete ? 'green' : 'gray'} bold={complete}>─ {line.text || ' '}</Text>
+      </Box>
+    );
+  }
+  if (line.kind === 'file') {
+    return (
+      <Box paddingX={2}>
+        <Text color="green">  ↳ </Text><Text>{line.text}</Text>
+      </Box>
+    );
+  }
+  if (line.kind === 'tool-head') {
+    return (
+      <Box paddingX={2}>
+        <Text color={line.status === 'error' ? 'red' : 'green'}>● </Text>
+        <Text bold>{line.text}</Text>
+        {line.accent ? <Text>({line.accent})</Text> : null}
+      </Box>
+    );
+  }
+  if (line.kind === 'tool-out') {
+    const body = line.lang === 'plan'
+      ? line.text.startsWith('☒')
+        ? <Text color="green" dimColor>{line.text}</Text>
+        : line.text.startsWith('▶')
+          ? <Text color={THEME_ACCENT} bold>{line.text}</Text>
+          : <Text dimColor>{line.text}</Text>
+      : line.lang
+      ? <Text>{highlightCodeBlock(line.text, line.lang)[0] ?? line.text}</Text>
+      : <Text color={line.elbow && line.status === 'error' ? 'red' : undefined} dimColor={!(line.elbow && line.status === 'error')}>{line.text || ' '}</Text>;
+    return (
+      <Box paddingX={2}>
+        {/* gray, not dimColor: dim and bold share SGR reset 22, and ink's
+            style merging let the indent's dim bleed into a bold row. */}
+        <Text color="gray">{line.elbow ? '  ⎿  ' : '     '}</Text>
+        {body}
+      </Box>
+    );
+  }
+  // Two-column gutter: the role marker on a message's first row, blank
+  // otherwise. It is identical while streaming and once settled, so rows
+  // never shift sideways when they move into scrollback.
+  const gutter = line.lead === 'agent'
+    ? <Text color={THEME_ACCENT}>● </Text>
+    : line.lead === 'user'
+      ? <Text color="gray" bold>{'> '}</Text>
+      : <Text>{'  '}</Text>;
+  if (line.kind === 'code-label') {
+    return (
+      <Box paddingX={2}>
+        {gutter}<Text dimColor>{line.text}</Text>
+      </Box>
+    );
+  }
+  if (line.kind === 'code') {
+    const highlighted = highlightCodeBlock(line.text, line.lang)[0] ?? line.text;
+    return (
+      <Box paddingX={2}>
+        {gutter}<Text>{'  '}{highlighted || ' '}</Text>
+      </Box>
+    );
+  }
+  return (
+    <Box paddingX={2}>
+      {gutter}<Text color={line.role === 'user' ? 'gray' : undefined}>{line.text || ' '}</Text>
+    </Box>
+  );
+}
+
+function MercuryBrandBlock({ brandLines }: { brandLines: MercuryTranscriptLine[] }): React.ReactNode {
+  return (
+    <Box flexDirection="column" flexShrink={0}>
+      {brandLines.map((line) => <MercuryTranscriptRow key={line.key} line={line} />)}
+    </Box>
+  );
+}
+
+function MercuryMessageBlock({ message, width }: { message: ChatMessage; width: number }): React.ReactNode {
+  // Progressive-chunk items carry ids like `${msgId}#c<i>`; only chunk 0
+  // renders the MERCURY/YOU role header — continuation chunks flow on.
+  const chunkIndex = parseChunkIndex(message.id);
+  const lines = buildMercuryMessageLines(message, width, { showHeader: chunkIndex == null || chunkIndex === 0 });
+  return (
+    <Box flexDirection="column" flexShrink={0}>
+      {lines.map((line) => <MercuryTranscriptRow key={line.key} line={line} />)}
+    </Box>
+  );
+}
+
+/**
+ * Mercury Code transcript — native scrollback model. Finalized messages print
+ * once through <Static> into the terminal's own scrollback, so the ENTIRE
+ * transcript (brand wordmark included) scrolls with the terminal's native
+ * scrolling and every row is drag-selectable. No sticky header, no in-app
+ * viewport: only a small live region (streaming tail, feedback, prompts,
+ * input, status) repaints per frame, which also removes the per-stream
+ * full-frame repaint flicker.
+ */
+export function MercuryCodeView({
+  state,
+  cols,
+  rows = 24,
+  input,
+  cursorPos,
+  permIdx,
+  ctrlCHint,
+}: {
+  state: TuiState;
+  cols: number;
+  rows?: number;
+  input?: string | undefined;
+  cursorPos?: number | undefined;
+  permIdx?: number | undefined;
+  ctrlCHint?: boolean;
+}): React.ReactNode {
+  const mc = state.mercuryCode;
+  const contentWidth = Math.max(20, cols - 4);
+  const brandLines = React.useMemo(() => buildMercuryBrandLines(state.version, cols), [state.version, cols]);
+  // Streaming message exclusion: the streaming message's content grows on
+  // every chunk, so it must stay out of <Static> (its identity key would
+  // print it once at whatever length it had when it first appeared). It
+  // renders in the live tail below and joins <Static> when finalized.
+  const finalizedMessages = React.useMemo(
+    () => state.chatMessages.filter((m) => !m.streaming && !m.id.startsWith('heartbeat-')),
+    [state.chatMessages],
+  );
+  const streamingMessage = state.chatMessages.find((m) => m.streaming && !m.id.startsWith('heartbeat-'));
+
+  // Live streaming tail: rendered through the same markdown pipeline as
+  // finalized messages, but on the bounded TAIL SLICE (fence-aligned with the
+  // full buffer) so per-frame work stays O(tail) — headers, bullets, and
+  // syntax-highlighted code render live instead of appearing only at the end.
+  // Recompute is throttled to ~120ms: the markdown/highlight pipeline is
+  // O(tail) and the diff-render only rewrites changed rows, so a slightly
+  // stale tail for one throttle window is imperceptible, while re-parsing
+  // the full slice on every 60ms chunk was measurable CPU on long streams.
+  // The block is PADDED to the row cap (spacer rows below the text) so the
+  // live region's height is constant for the whole stream — ink's erase
+  // arithmetic (log-update) never changes the region's line count, which is
+  // what made the user's scroll position churn ("takes me back") while a
+  // response streamed. Released when the message finalizes into <Static>.
+  // Progressive flush bookkeeping: ids that streamed through settled-chunk
+  // <Static> items this session. When such a message finalizes it must KEEP
+  // its chunk representation (identical item keys) — rendering it as one
+  // whole-message item would re-print blocks <Static> already emitted.
+  const streamedIdsRef = React.useRef<Set<string>>(new Set());
+
+  // Settled markdown blocks of the streaming message, flushed into <Static>
+  // as they complete (blank-line-terminated paragraph, closed code fence).
+  // <Static> prints each new item exactly once, so the document builds
+  // top-to-bottom in scrollback during the stream; only the unsettled
+  // remainder renders in the live tail below. Bookkeeping is ref-based like
+  // the tail throttle below (React state would loop).
+  const streamingChunks = React.useMemo(() => {
+    if (!streamingMessage) return { chunks: [] as ChatMessage[], remainderStart: 0 };
+    streamedIdsRef.current.add(streamingMessage.id);
+    return splitStreamingMessage(streamingMessage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- ref bookkeeping, not state
+  }, [streamingMessage]);
+
+  const tailCap = streamTailRowCap(rows);
+  // 120 ms throttle with a trailing flush (useThrottledStreamTail): the
+  // last delta of a stream is always painted.
+  const streamTail = useThrottledStreamTail(
+    streamingMessage,
+    (message) => {
+      // The live tail renders only the unsettled remainder (settled blocks
+      // have already joined <Static> above); the 32KB fence-aligned slice
+      // stays as the safety net for a huge in-progress block.
+      const remainderMessage = { ...message, content: message.content.slice(streamingChunks.remainderStart) };
+      // Role marker only while the remainder is still the message's first block.
+      return buildStreamTailLines(remainderMessage, contentWidth, STREAM_TAIL_CHARS, tailCap, { showHeader: streamingChunks.remainderStart === 0 });
+    },
+    [] as MercuryTranscriptLine[],
+    [contentWidth, tailCap, streamingChunks.remainderStart],
+  );
+  const paddedStreamTail = React.useMemo(() => {
+    if (streamTail.length === 0) return streamTail;
+    const pad = tailCap - streamTail.length;
+    if (pad <= 0) return streamTail;
+    return [
+      ...streamTail,
+      ...Array.from({ length: pad }, (_, i): MercuryTranscriptLine => ({ key: `tail:pad:${i}`, kind: 'spacer' as const, role: 'system' as const, text: '' })),
+    ];
+  }, [streamTail, tailCap]);
+  const streamTailRows = paddedStreamTail;
+
+  if (!mc) {
+    return (
+      <Box paddingX={1}>
+        <Text color="yellow">Mercury Code is not active. Type /code to enter.</Text>
+      </Box>
+    );
+  }
+
+  // <Static> items: brand block, then per-message content. Messages that
+  // streamed through settled chunks keep their chunk items (identical keys —
+  // finalization appends exactly one tail-chunk item); every other message
+  // renders whole, as before.
+  const streamedIds = streamedIdsRef.current;
+  const staticItems: Array<string | ChatMessage> = [
+    MERCURY_BRAND_ITEM_KEY,
+    ...finalizedMessages.slice(-MAX_STATIC_MESSAGES).flatMap((message) =>
+      streamedIds.has(message.id) ? splitFinalMessage(message) : [message]),
+    ...streamingChunks.chunks,
+  ];
+
+  // Status bar (single row): a short contextual hint on the left, session
+  // state on the right. Everything that isn't state is dropped — the old bar
+  // listed a wall of key hints ("esc esc exit · wheel scrolls · drag
+  // selects · …") that wrapped onto a second line and pushed the state
+  // segments (model, tokens) out of view. Non-git workspaces show no git
+  // segment at all instead of the meaningless "⎇ not-a-git-repo · ✓".
+  const mode = state.programmingMode;
+  const modeLabel = mode === 'execute' ? 'EXECUTE' : mode === 'plan' ? 'PLAN' : mode === 'auto' ? 'AUTO' : 'CHAT';
+  const git = mc.git;
+  // '' = not read yet (async refresh pending); hide the segment until then.
+  const hasGit = git.branch !== '' && git.branch !== 'no-git' && git.branch !== 'not-a-git-repo';
+  // Same row builder as chat (src/ui/status-bar.ts): permission, budget
+  // meter, model (no provider name), mode, then the folder and branch;
+  // fitted to the width in priority order so nothing collides or wraps.
+  // Optimus activity, when there is any, is the last thing dropped.
+  const extras: StatusSegment[] = [];
+  if (hasGit) {
+    const gitBits = [`⎇ ${git.branch}`];
+    if (git.ahead > 0) gitBits.push(`↑${git.ahead}`);
+    if (git.behind > 0) gitBits.push(`↓${git.behind}`);
+    if (git.dirty > 0) gitBits.push(`±${git.dirty}`);
+    extras.push({ text: gitBits.join(' '), compact: `⎇ ${git.branch}`, color: 'blue', priority: 6 });
+  }
+  extras.push({ text: mc.dirName, color: THEME_ACCENT, priority: 7 });
+  extras.push({ text: modeLabel, color: mode === 'execute' ? 'green' : mode === 'plan' ? 'yellow' : THEME_ACCENT, priority: 4 });
+  const rightSegs = fitSegments(statusSegments({
+    provider: state.provider,
+    permission: state.permissionMode,
+    tokensPct: state.tokenInfo ? state.tokenInfo.percentage : null,
+    desktop: state.desktopActivity,
+    updateAvailable: state.updateAvailable,
+    extras,
+  }), Math.max(10, cols - 6 - (ctrlCHint || state.tuiFrozen ? 40 : 0)));
+  const SEP = ' · ';
+  // Freeze hint lives in the status bar (not a new row) so the live region's
+  // height stays constant — a new row would re-introduce scrollback churn.
+  const leftHint = ctrlCHint
+    ? CTRL_C_EXIT_HINT
+    : state.tuiFrozen
+    ? `${TUI_FROZEN_HINT_MARKER} — Ctrl+S to resume · /mc resume`
+    : mc.exitConfirm || state.permissionPrompt
+    ? '' // the prompt / confirm box already shows its own controls
+    : state.isThinking || state.toolSteps.some((s) => s.status === 'running') || state.subAgents.some((a) => a.status === 'running')
+      ? '' // the live feedback block above is showing progress (esc interrupts)
+      : ''; // idle: the row is status only
+
+  const showHints = finalizedMessages.length === 0 && streamTail.length === 0;
+
+  return (
+    <Box flexDirection="column" flexShrink={0}>
+      <Static items={staticItems} itemKey={staticItemKey}>
+        {(item) => typeof item === 'string'
+          ? <MercuryBrandBlock key={item} brandLines={brandLines} />
+          : <MercuryMessageBlock key={item.id} message={item} width={contentWidth} />}
+      </Static>
+      {streamTailRows.length > 0 && (
+        <Box flexDirection="column" flexShrink={0}>
+          {streamTailRows.map((line) => <MercuryTranscriptRow key={line.key} line={line} />)}
+        </Box>
+      )}
+      {showHints && <MercuryCodeHints cols={cols} />}
+      {state.planProgress && state.planProgress.length > 0 && <PlanProgressView steps={state.planProgress} />}
+      <MercuryLiveFeedback state={state} />
+      {state.permissionPrompt && <PermPromptView prompt={state.permissionPrompt} activeIdx={permIdx ?? 0} />}
+      {mc.exitConfirm && <MercuryCodeExitConfirm boxWidth={Math.max(12, cols - 4)} />}
+      <MercuryCodeInput input={input ?? ''} cursorPos={cursorPos ?? 0} mode={state.programmingMode} boxWidth={Math.max(12, cols - 4)} cursorActive={!state.permissionPrompt && !mc.exitConfirm} />
+      <Box height={1} overflow="hidden" paddingX={2} flexShrink={0}>
+        <Text dimColor={!ctrlCHint} color={ctrlCHint ? 'yellow' : undefined}>{leftHint}</Text>
+        <Spacer />
+        <Text wrap="truncate-end">
+          {rightSegs.map((seg, i) => (
+            <React.Fragment key={`${seg.priority}:${i}`}>
+              {i > 0 && <Text color="gray">{SEP}</Text>}
+              <Text color={seg.color}>{seg.text}</Text>
+            </React.Fragment>
+          ))}
+        </Text>
+      </Box>
+    </Box>
+  );
+}

@@ -1,0 +1,1569 @@
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, closeSync, openSync, renameSync, unlinkSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { config as loadDotenv } from 'dotenv';
+import { logger } from './logger.js';
+import type { SignalAccessUser, SignalPendingRequest, DiscordAccessUser, DiscordPendingRequest, SlackAccessUser, SlackPendingRequest } from '../types/channel.js';
+import type { McpConfig } from '../capabilities/mcp/types.js';
+import {
+  LEGACY_SEED_API_URL,
+  LEGACY_SEED_WS_URL,
+  MERCURY_CLOUD_API_URL,
+  MERCURY_CLOUD_WS_URL,
+} from '../cloud/endpoints.js';
+
+const MERCURY_HOME = join(homedir(), '.mercury');
+
+loadDotenv();
+const mercuryEnvPath = join(MERCURY_HOME, '.env');
+if (existsSync(mercuryEnvPath)) {
+  loadDotenv({ path: mercuryEnvPath });
+}
+
+export function getMercuryHome(): string {
+  return process.env.MERCURY_HOME || MERCURY_HOME;
+}
+
+export function getMemoryDir(): string {
+  return join(getMercuryHome(), 'memory');
+}
+
+export interface ProviderConfig {
+  name: string;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  enabled: boolean;
+  /** Optional per-provider cap on output tokens per request. */
+  maxOutputTokens?: number;
+  /**
+   * The owner says this endpoint's model reads images. `modelSeesImages` otherwise
+   * guesses from the model name, which cannot know about a self-hosted model — a
+   * local Qwen-VL called `qwen3.8-flash-next` was refused for that reason.
+   */
+  vision?: boolean;
+  /**
+   * HTTP Basic credentials for a server behind a reverse proxy. When `username`
+   * is set, Mercury sends `Authorization: Basic ...` instead of the Bearer key.
+   */
+  username?: string;
+  password?: string;
+}
+
+export interface TelegramAccessUser {
+  userId: number;
+  chatId: number;
+  username?: string;
+  firstName?: string;
+  requestedAt?: string;
+  approvedAt: string;
+}
+
+export interface TelegramPendingRequest {
+  userId: number;
+  chatId: number;
+  username?: string;
+  firstName?: string;
+  requestedAt: string;
+  pairingCode?: string;
+}
+
+export type ProviderName =
+  | 'mercuryCloud'
+  | 'aimlapi'
+  | 'openai'
+  | 'anthropic'
+  | 'deepseek'
+  | 'grok'
+  | 'atlascloud'
+  | 'runcrate'
+  | 'cloudgpu'
+  | 'ollamaCloud'
+  | 'ollamaLocal'
+  | 'atomicChat'
+  | 'openaiCompat'
+  | 'mimo'
+  | 'mimoTokenPlan'
+  | 'lmStudio'
+  | 'chatgptWeb'
+  | 'githubCopilot'
+  | 'litellm';
+
+export interface CloudConfig {
+  enabled: boolean;
+  apiUrl: string;
+  wsUrl: string;
+  jwt: string;
+  refreshToken: string;
+  agentId: string;
+  tier: string;
+  agentApiKey: string;
+  accessKey?: string;
+}
+
+export interface MercuryConfig {
+  identity: {
+    name: string;
+    owner: string;
+    creator?: string;
+    /**
+     * Background Mercury should always know and can talk about: who made it,
+     * the team, what it's for. Included in every chat and call.
+     */
+    about?: string;
+  };
+  cloud: CloudConfig;
+  providers: {
+    default: ProviderName;
+    aimlapi: ProviderConfig;
+    mercuryCloud: ProviderConfig;
+    openai: ProviderConfig;
+    anthropic: ProviderConfig;
+    deepseek: ProviderConfig;
+    grok: ProviderConfig;
+    atlascloud: ProviderConfig;
+    runcrate: ProviderConfig;
+    cloudgpu: ProviderConfig;
+    ollamaCloud: ProviderConfig;
+    ollamaLocal: ProviderConfig;
+    atomicChat: ProviderConfig;
+    openaiCompat: ProviderConfig;
+    mimo: ProviderConfig;
+    mimoTokenPlan: ProviderConfig;
+    lmStudio: ProviderConfig;
+    chatgptWeb: ProviderConfig;
+    githubCopilot: ProviderConfig;
+    litellm: ProviderConfig;
+  };
+  channels: {
+    telegram: {
+      enabled: boolean;
+      botToken: string;
+      webhookUrl?: string;
+      allowedChatIds?: number[];
+      streaming?: boolean;
+      admins: TelegramAccessUser[];
+      members: TelegramAccessUser[];
+      pending: TelegramPendingRequest[];
+      pairedUserId?: number;
+      pairedChatId?: number;
+      pairedUsername?: string;
+    };
+    signal: {
+      enabled: boolean;
+      phoneNumber: string;
+      mode: string;
+      groupId?: string;
+      groupName?: string;
+      admins: SignalAccessUser[];
+      members: SignalAccessUser[];
+      pending: SignalPendingRequest[];
+    };
+    discord: {
+      enabled: boolean;
+      botToken: string;
+      guildId?: string;
+      channelId?: string;
+      adminRoleName?: string;
+      streaming?: boolean;
+      admins: DiscordAccessUser[];
+      members: DiscordAccessUser[];
+      pending: DiscordPendingRequest[];
+    };
+    slack: {
+      enabled: boolean;
+      botToken: string;
+      appToken: string;
+      channelId?: string;
+      teamId?: string;
+      streaming?: boolean;
+      admins: SlackAccessUser[];
+      members: SlackAccessUser[];
+      pending: SlackPendingRequest[];
+    };
+  };
+  github: {
+    username: string;
+    email: string;
+    defaultOwner: string;
+    defaultRepo: string;
+  };
+  memory: {
+    shortTermMaxMessages: number;
+    secondBrain: {
+      enabled: boolean;
+    };
+    collaborativeKnowledge?: {
+      /** When true, new memories extracted via remember() are marked shareable. */
+      shareLearning?: boolean;
+      /** When true, the agent queries the cloud shared pool for additional
+       *  context after retrieving from its local second brain. Defaults to
+       *  true when the agent is paired with Mercury Cloud. */
+      poolSearch?: boolean;
+    };
+    /** The Owner Model's learning calls (ADR-026): per-turn extraction and the reflection pass. */
+    learning?: {
+      /**
+       * Provider to run extraction and reflection on, by name from `providers`.
+       * Unset (or not usable) → the default chat provider. These are strict
+       * JSON tasks, so a capable mid-tier model (e.g. anthropic with a Haiku
+       * model) learns far better than a free tier.
+       */
+      provider?: string;
+    };
+  };
+  heartbeat: {
+    intervalMinutes: number;
+  };
+  tokens: {
+    dailyBudget: number;
+    /** When true, Token Saver Mode is manually enabled. Persisted. */
+    saverMode?: boolean;
+    /** Percentage of daily budget at which saver auto-engages (0 disables). */
+    saverAutoThreshold?: number;
+    /** Master switch for automatic engagement (defaults to true). */
+    saverAutoEnabled?: boolean;
+    /** Lifetime estimated tokens saved by saver mode (informational). */
+    saverTokensSavedLifetime?: number;
+    /**
+     * How much one cache-hit input token counts toward `dailyBudget`, 0–1.
+     * Default 1: every token counts. 0.1 roughly tracks cost, since providers
+     * bill cache hits at a fraction of the input price. Out-of-range values
+     * are clamped; anything non-numeric counts as 1.
+     */
+    cachedWeight?: number;
+  };
+  subagents: {
+    enabled: boolean;
+    maxConcurrent: number;
+    mode: 'auto' | 'manual';
+  };
+  bots: {
+    enabled: boolean;
+    /** 0 = auto (clamp(2, cpus-1)). Fleet-wide cap on concurrent bot turns. */
+    maxConcurrent: number;
+    /** Shared secret for POST /api/bots/:id/hooks/* (unset = session auth only). */
+    webhookSecret?: string;
+    /** Auto-skill synthesis: draft SKILL.md from completed multi-step bot runs. */
+    autoSkill?: {
+      enabled?: boolean;
+    };
+    /** Fleet hierarchies: lead bots managing a crew of sub-bots. */
+    fleets?: {
+      /** Hard cap on crew size per lead (CrewAI guidance: 3-6 for delegation accuracy). */
+      maxCrew?: number;
+      /** Lead bots may create/remove their own crew via bot_spawn/bot_retire. */
+      allowLeadSpawn?: boolean;
+      /** Provider crew bots use when their manifest sets none (a cheaper lane for stage work). ADR-021. */
+      crewProvider?: string;
+    };
+    /** Per-bot daily token cap applied when a bot sets none (0 = unlimited). ADR-020. */
+    suggestedDailyTokenBudget?: number;
+    /** Fleet-wide daily token cap across all bots (0 = unlimited). ADR-020. */
+    fleetDailyTokenBudget?: number;
+    /** Fewest minutes between two runs of any bot routine (default 15). */
+    routineMinGapMinutes?: number;
+    /** How long a bot waits for the owner to answer its question before it's a no (default 10, max 60). */
+    approvalWaitMinutes?: number;
+    /** Owner-visible folder for finished results (default: ~/Documents/Mercury). */
+    deliverablesDir?: string;
+    retention: {
+      transcriptRuns: number;
+      journalRotateBytes: number;
+      journalKeepRotations: number;
+      mailboxTtlHours: number;
+      dlqCap: number;
+      artifactQuotaBytes: number;
+      /** Retention janitor for the fleet-shared folder (disabled = never sweep). */
+      sandboxJanitor: {
+        enabled: boolean;
+        /** Days a file stays in the working surface. */
+        hotDays: number;
+        /** Days an archived file survives before deletion. */
+        archiveDays: number;
+      };
+    };
+  };
+  spotify: {
+    enabled: boolean;
+    clientId: string;
+    clientSecret: string;
+    redirectUri: string;
+    accessToken: string;
+    refreshToken: string;
+    expiresAt: string;
+    scopes: string[];
+    deviceId: string;
+    accountName: string;
+    accountId: string;
+    product: string;
+  };
+  web: {
+    enabled: boolean;
+    port: number;
+    /**
+     * Extra browser origins allowed to call /api/* with a Bearer token
+     * (CORS). Mercury Desktop's own origins are always allowed; list a
+     * self-hosted web build or a dev server here. Never '*'.
+     */
+    corsOrigins?: string[];
+    /**
+     * Host names this server may be reached by directly, besides localhost —
+     * only for a proxy of your own that rewrites Host and adds no forwarding
+     * headers. Anything else is refused (DNS rebinding).
+     */
+    allowedHosts?: string[];
+  };
+  mcp?: McpConfig;
+  /** Opt-in: discover plugin and MCP schemas on demand in the main agent's tool loop. */
+  toolDiscovery?: { enabled?: boolean };
+  /**
+   * Chat turns running at once (ADR-037). One turn per chat at a time; this
+   * caps how many chats are worked on together. 0 = automatic (from heap
+   * size, RAM and platform; 2 on Termux). The turn governor admits fewer
+   * while memory is tight.
+   */
+  concurrency?: { maxTurns?: number };
+  /** Where the files Mercury makes go (default ~/mercury-artifacts): Research/ and one folder per chat. */
+  artifacts?: {
+    outputDir?: string;
+  };
+}
+
+function getEnv(key: string, fallback: string = ''): string {
+  return process.env[key] || fallback;
+}
+
+function getEnvNum(key: string, fallback: number): number {
+  const val = process.env[key];
+  return val ? parseInt(val, 10) : fallback;
+}
+
+function getEnvBool(key: string, fallback: boolean): boolean {
+  const val = process.env[key]?.toLowerCase();
+  if (val === 'true') return true;
+  if (val === 'false') return false;
+  return fallback;
+}
+
+/**
+ * A capability the owner declares, where "not set" is a third state.
+ *
+ * `getEnvBool(key, false)` would answer `false` for a variable nobody set, and a `false` is a
+ * declaration: it switches images off for a model whose name the guesser would have accepted
+ * (`gpt-4o` behind a gateway). Undefined means "nothing declared", so the name-based guess in
+ * `modelSeesImages` still applies.
+ */
+function getEnvOptionalBool(key: string): boolean | undefined {
+  const val = process.env[key]?.toLowerCase();
+  if (val === 'true') return true;
+  if (val === 'false') return false;
+  return undefined;
+}
+
+export function getDefaultConfig(): MercuryConfig {
+  const home = getMercuryHome();
+  const cloudApiUrl = getEnv('MERCURY_CLOUD_API_URL', MERCURY_CLOUD_API_URL);
+  const cloudWsUrl = getEnv('MERCURY_CLOUD_WS_URL', MERCURY_CLOUD_WS_URL);
+  return {
+    identity: {
+      name: getEnv('MERCURY_NAME', 'Mercury'),
+      owner: getEnv('MERCURY_OWNER', ''),
+      creator: getEnv('MERCURY_CREATOR', ''),
+      about: getEnv('MERCURY_ABOUT', ''),
+    },
+    cloud: {
+      enabled: getEnvBool('MERCURY_CLOUD_ENABLED', false),
+      apiUrl: cloudApiUrl,
+      wsUrl: cloudWsUrl,
+      jwt: getEnv('MERCURY_CLOUD_JWT', ''),
+      refreshToken: getEnv('MERCURY_CLOUD_REFRESH_TOKEN', ''),
+      agentId: getEnv('MERCURY_CLOUD_AGENT_ID', ''),
+      tier: getEnv('MERCURY_CLOUD_TIER', 'free'),
+      agentApiKey: getEnv('MERCURY_CLOUD_AGENT_API_KEY', ''),
+      accessKey: getEnv('MERCURY_CLOUD_ACCESS_KEY', ''),
+    },
+    providers: {
+      default: getEnv('DEFAULT_PROVIDER', 'deepseek') as ProviderName,
+      aimlapi: {
+        name: 'aimlapi',
+        apiKey: getEnv('AIMLAPI_API_KEY', ''),
+        baseUrl: getEnv('AIMLAPI_BASE_URL', 'https://api.aimlapi.com/v1'),
+        model: getEnv('AIMLAPI_MODEL', 'anthropic/claude-sonnet-4.6'),
+        enabled: getEnvBool('AIMLAPI_ENABLED', true),
+      },
+      mercuryCloud: {
+        name: 'mercuryCloud',
+        apiKey: '',
+        baseUrl: cloudApiUrl,
+        model: getEnv('MERCURY_CLOUD_MODEL', 'mercury-mini'),
+        enabled: getEnvBool('MERCURY_CLOUD_ENABLED', false),
+      },
+      openai: {
+        name: 'openai',
+        apiKey: getEnv('OPENAI_API_KEY', ''),
+        baseUrl: getEnv('OPENAI_BASE_URL', 'https://api.openai.com/v1'),
+        model: getEnv('OPENAI_MODEL', 'gpt-4o-mini'),
+        enabled: getEnvBool('OPENAI_ENABLED', true),
+      },
+      anthropic: {
+        name: 'anthropic',
+        apiKey: getEnv('ANTHROPIC_API_KEY', ''),
+        baseUrl: getEnv('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'),
+        model: getEnv('ANTHROPIC_MODEL', 'claude-sonnet-4-20250514'),
+        enabled: getEnvBool('ANTHROPIC_ENABLED', true),
+      },
+      deepseek: {
+        name: 'deepseek',
+        apiKey: getEnv('DEEPSEEK_API_KEY', ''),
+        baseUrl: getEnv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1'),
+        model: getEnv('DEEPSEEK_MODEL', 'deepseek-chat'),
+        enabled: getEnvBool('DEEPSEEK_ENABLED', true),
+        ...(getEnv('DEEPSEEK_MAX_OUTPUT_TOKENS', '') ? { maxOutputTokens: Number(getEnv('DEEPSEEK_MAX_OUTPUT_TOKENS', '')) } : {}),
+      },
+      grok: {
+        name: 'grok',
+        apiKey: getEnv('GROK_API_KEY', ''),
+        baseUrl: getEnv('GROK_BASE_URL', 'https://api.x.ai/v1'),
+        model: getEnv('GROK_MODEL', 'grok-4'),
+        enabled: getEnvBool('GROK_ENABLED', true),
+      },
+      atlascloud: {
+        name: 'atlascloud',
+        apiKey: getEnv('ATLASCLOUD_API_KEY', ''),
+        baseUrl: getEnv('ATLASCLOUD_BASE_URL', 'https://api.atlascloud.ai/v1'),
+        model: getEnv('ATLASCLOUD_MODEL', 'qwen/qwen3.5-flash'),
+        enabled: getEnvBool('ATLASCLOUD_ENABLED', true),
+      },
+      runcrate: {
+        name: 'runcrate',
+        apiKey: getEnv('RUNCRATE_API_KEY', ''),
+        baseUrl: getEnv('RUNCRATE_BASE_URL', 'https://api.runcrate.ai/v1'),
+        model: getEnv('RUNCRATE_MODEL', 'deepseek-ai/DeepSeek-V4.1-Flash'),
+        enabled: getEnvBool('RUNCRATE_ENABLED', true),
+      },
+      cloudgpu: {
+        name: 'cloudgpu',
+        apiKey: getEnv('CLOUDGPU_API_KEY', ''),
+        baseUrl: getEnv('CLOUDGPU_BASE_URL', 'https://cloudgpu.app/v1'),
+        model: getEnv('CLOUDGPU_MODEL', 'deepseek-v4.1-flash'),
+        enabled: getEnvBool('CLOUDGPU_ENABLED', true),
+      },
+      ollamaCloud: {
+        name: 'ollamaCloud',
+        apiKey: getEnv('OLLAMA_CLOUD_API_KEY', ''),
+        baseUrl: getEnv('OLLAMA_CLOUD_BASE_URL', 'https://ollama.com/v1'),
+        model: getEnv('OLLAMA_CLOUD_MODEL', 'gpt-oss:120b'),
+        enabled: getEnvBool('OLLAMA_CLOUD_ENABLED', true),
+      },
+      ollamaLocal: {
+        name: 'ollamaLocal',
+        apiKey: '',
+        baseUrl: getEnv('OLLAMA_LOCAL_BASE_URL', 'http://127.0.0.1:11434/v1'),
+        model: getEnv('OLLAMA_LOCAL_MODEL', ''),
+        enabled: getEnvBool('OLLAMA_LOCAL_ENABLED', false),
+      },
+      atomicChat: {
+        name: 'atomicChat',
+        apiKey: '',
+        baseUrl: getEnv('ATOMIC_CHAT_BASE_URL', 'http://127.0.0.1:1337/v1'),
+        model: getEnv('ATOMIC_CHAT_MODEL', ''),
+        enabled: getEnvBool('ATOMIC_CHAT_ENABLED', false),
+      },
+      openaiCompat: {
+        name: 'openaiCompat',
+        apiKey: getEnv('OPENAI_COMPAT_API_KEY', ''),
+        baseUrl: getEnv('OPENAI_COMPAT_BASE_URL', ''),
+        model: getEnv('OPENAI_COMPAT_MODEL', ''),
+        enabled: getEnvBool('OPENAI_COMPAT_ENABLED', false),
+        vision: getEnvOptionalBool('OPENAI_COMPAT_VISION'),
+      },
+      mimo: {
+        name: 'mimo',
+        apiKey: getEnv('MIMO_API_KEY', ''),
+        baseUrl: getEnv('MIMO_BASE_URL', 'https://api.xiaomimimo.com/v1'),
+        model: getEnv('MIMO_MODEL', 'mimo-v2.5-pro'),
+        enabled: getEnvBool('MIMO_ENABLED', true),
+      },
+      mimoTokenPlan: {
+        name: 'mimoTokenPlan',
+        apiKey: getEnv('MIMO_TOKEN_PLAN_API_KEY', ''),
+        baseUrl: getEnv('MIMO_TOKEN_PLAN_BASE_URL', 'https://token-plan-cn.xiaomimimo.com/v1'),
+        model: getEnv('MIMO_TOKEN_PLAN_MODEL', 'mimo-v2.5-pro'),
+        enabled: getEnvBool('MIMO_TOKEN_PLAN_ENABLED', false),
+      },
+      lmStudio: {
+        name: 'lmStudio',
+        apiKey: getEnv('LM_STUDIO_API_KEY', ''),
+        vision: getEnvOptionalBool('LM_STUDIO_VISION'),
+        baseUrl: getEnv('LM_STUDIO_BASE_URL', 'http://127.0.0.1:1234/v1'),
+        model: getEnv('LM_STUDIO_MODEL', ''),
+        enabled: getEnvBool('LM_STUDIO_ENABLED', false),
+      },
+      chatgptWeb: {
+        name: 'chatgptWeb',
+        apiKey: '', // not used — auth is via OAuth
+        baseUrl: 'https://chatgpt.com/backend-api',
+        model: getEnv('CHATGPT_WEB_MODEL', 'gpt-5.4-mini'),
+        enabled: getEnvBool('CHATGPT_WEB_ENABLED', false),
+      },
+      githubCopilot: {
+        name: 'githubCopilot',
+        apiKey: '', // not used — auth is via GitHub OAuth
+        baseUrl: '', // dynamic — resolved from Copilot token exchange
+        model: getEnv('GITHUB_COPILOT_MODEL', 'gpt-4o'),
+        enabled: getEnvBool('GITHUB_COPILOT_ENABLED', false),
+      },
+      litellm: {
+        name: 'litellm',
+        apiKey: getEnv('LITELLM_API_KEY', ''),
+        baseUrl: getEnv('LITELLM_BASE_URL', 'http://localhost:4000/v1'),
+        model: getEnv('LITELLM_MODEL', 'gpt-4o-mini'),
+        enabled: getEnvBool('LITELLM_ENABLED', false),
+        vision: getEnvOptionalBool('LITELLM_VISION'),
+      },
+    },
+    channels: {
+      telegram: {
+        enabled: getEnvBool('TELEGRAM_ENABLED', false),
+        botToken: getEnv('TELEGRAM_BOT_TOKEN', ''),
+        webhookUrl: getEnv('TELEGRAM_WEBHOOK_URL', ''),
+        allowedChatIds: getEnv('TELEGRAM_ALLOWED_CHAT_IDS', '')
+          .split(',')
+          .filter(Boolean)
+          .map(Number),
+        streaming: getEnvBool('TELEGRAM_STREAMING', true),
+        admins: [],
+        members: [],
+        pending: [],
+      },
+      signal: {
+        enabled: getEnvBool('SIGNAL_ENABLED', false),
+        phoneNumber: getEnv('SIGNAL_PHONE_NUMBER', ''),
+        mode: getEnv('SIGNAL_MODE', 'group'),
+        groupId: getEnv('SIGNAL_GROUP_ID', ''),
+        groupName: getEnv('SIGNAL_GROUP_NAME', 'Mercury'),
+        admins: [],
+        members: [],
+        pending: [],
+      },
+      discord: {
+        enabled: getEnvBool('DISCORD_ENABLED', false),
+        botToken: getEnv('DISCORD_BOT_TOKEN', ''),
+        guildId: getEnv('DISCORD_GUILD_ID', ''),
+        channelId: getEnv('DISCORD_CHANNEL_ID', ''),
+        adminRoleName: getEnv('DISCORD_ADMIN_ROLE_NAME', 'Mercury Admin'),
+        streaming: getEnvBool('DISCORD_STREAMING', true),
+        admins: [],
+        members: [],
+        pending: [],
+      },
+      slack: {
+        enabled: getEnvBool('SLACK_ENABLED', false),
+        botToken: getEnv('SLACK_BOT_TOKEN', ''),
+        appToken: getEnv('SLACK_APP_TOKEN', ''),
+        channelId: getEnv('SLACK_CHANNEL_ID', ''),
+        teamId: getEnv('SLACK_TEAM_ID', ''),
+        streaming: getEnvBool('SLACK_STREAMING', true),
+        admins: [],
+        members: [],
+        pending: [],
+      },
+    },
+    github: {
+      username: getEnv('GITHUB_USERNAME', ''),
+      email: getEnv('GITHUB_EMAIL', 'mercury@cosmicstack.org'),
+      defaultOwner: getEnv('GITHUB_DEFAULT_OWNER', ''),
+      defaultRepo: getEnv('GITHUB_DEFAULT_REPO', ''),
+    },
+    memory: {
+      shortTermMaxMessages: getEnvNum('SHORT_TERM_MAX_MESSAGES', 20),
+      secondBrain: {
+        enabled: getEnvBool('SECOND_BRAIN_ENABLED', true),
+      },
+      collaborativeKnowledge: {
+        shareLearning: getEnvBool('SHARE_LEARNING', false),
+        poolSearch: getEnvBool('POOL_SEARCH', true),
+      },
+      learning: {
+        ...(process.env.LEARNING_PROVIDER ? { provider: process.env.LEARNING_PROVIDER } : {}),
+      },
+    },
+    heartbeat: {
+      intervalMinutes: getEnvNum('HEARTBEAT_INTERVAL_MINUTES', 60),
+    },
+    tokens: {
+      dailyBudget: getEnvNum('DAILY_TOKEN_BUDGET', 1_000_000),
+    },
+    subagents: {
+      enabled: getEnvBool('SUBAGENTS_ENABLED', true),
+      maxConcurrent: getEnvNum('SUBAGENTS_MAX_CONCURRENT', 0),
+      mode: (process.env.SUBAGENTS_MODE as 'auto' | 'manual') || 'auto',
+    },
+    bots: {
+      enabled: getEnvBool('BOTS_ENABLED', true),
+      maxConcurrent: getEnvNum('BOTS_MAX_CONCURRENT', 0),
+      webhookSecret: getEnv('BOTS_WEBHOOK_SECRET') || undefined,
+      autoSkill: {
+        enabled: getEnvBool('BOTS_AUTO_SKILL', false),
+      },
+      fleets: {
+        maxCrew: getEnvNum('BOTS_FLEET_MAX_CREW', 6),
+        allowLeadSpawn: getEnvBool('BOTS_FLEET_LEAD_SPAWN', true),
+        crewProvider: getEnv('BOTS_FLEET_CREW_PROVIDER') || undefined,
+      },
+      suggestedDailyTokenBudget: getEnvNum('BOTS_SUGGESTED_DAILY_TOKEN_BUDGET', 5_000_000),
+      fleetDailyTokenBudget: getEnvNum('BOTS_FLEET_DAILY_TOKEN_BUDGET', 20_000_000),
+      deliverablesDir: getEnv('BOTS_DELIVERABLES_DIR') || undefined,
+      retention: {
+        transcriptRuns: getEnvNum('BOTS_RETENTION_TRANSCRIPT_RUNS', 50),
+        journalRotateBytes: getEnvNum('BOTS_JOURNAL_ROTATE_BYTES', 5 * 1024 * 1024),
+        journalKeepRotations: getEnvNum('BOTS_JOURNAL_KEEP_ROTATIONS', 3),
+        mailboxTtlHours: getEnvNum('BOTS_MAILBOX_TTL_HOURS', 72),
+        dlqCap: getEnvNum('BOTS_DLQ_CAP', 100),
+        artifactQuotaBytes: getEnvNum('BOTS_ARTIFACT_QUOTA_BYTES', 500 * 1024 * 1024),
+        sandboxJanitor: {
+          enabled: getEnvBool('BOTS_SANDBOX_JANITOR', true),
+          hotDays: getEnvNum('BOTS_SANDBOX_HOT_DAYS', 7),
+          archiveDays: getEnvNum('BOTS_SANDBOX_ARCHIVE_DAYS', 30),
+        },
+      },
+    },
+    spotify: {
+      enabled: getEnvBool('SPOTIFY_ENABLED', false),
+      clientId: getEnv('SPOTIFY_CLIENT_ID'),
+      clientSecret: getEnv('SPOTIFY_CLIENT_SECRET'),
+      redirectUri: getEnv('SPOTIFY_REDIRECT_URI', 'http://127.0.0.1:8888/callback'),
+      accessToken: '',
+      refreshToken: '',
+      expiresAt: '',
+      scopes: [],
+      deviceId: '',
+      accountName: '',
+      accountId: '',
+      product: '',
+    },
+    toolDiscovery: { enabled: getEnvBool('MERCURY_TOOL_DISCOVERY', false) },
+    concurrency: { maxTurns: getEnvNum('MERCURY_MAX_CONCURRENT_TURNS', 0) },
+    web: {
+      enabled: getEnvBool('MERCURY_WEB_ENABLED', false),
+      port: getEnvNum('MERCURY_PORT', 6174),
+    },
+  };
+}
+
+const CONFIG_PATH = join(getMercuryHome(), 'mercury.yaml');
+const CONFIG_LOCK_PATH = `${CONFIG_PATH}.lock`;
+
+export function loadConfig(): MercuryConfig {
+  if (existsSync(CONFIG_PATH)) {
+    // Tighten permissions on an existing config file that contains live
+    // tokens but was written before the 0600 default.
+    try { chmodSync(CONFIG_PATH, 0o600); } catch {}
+    const raw = readFileSync(CONFIG_PATH, 'utf-8');
+    const fileConfig = parseYaml(raw) as Partial<MercuryConfig>;
+    const defaults = getDefaultConfig();
+    return normalizeCloudConfig(migrateLegacyChatGPTModel(
+      migrateLegacyDiscordAccess(
+        migrateLegacyOllamaLocalBaseUrl(
+          migrateLegacyOllamaCloudBaseUrl(
+            migrateLegacySignalAccess(
+              migrateLegacyTelegramAccess(deepMerge(defaults, fileConfig)),
+            ),
+          ),
+        ),
+      ),
+    ));
+  }
+  return normalizeCloudConfig(migrateLegacyChatGPTModel(
+    migrateLegacyDiscordAccess(
+      migrateLegacyTelegramAccess(getDefaultConfig()),
+    ),
+  ));
+}
+
+/**
+ * 2026-09: OpenAI's Codex-for-ChatGPT backend now validates the model slug
+ * against the account's LIVE entitlements and rejects everything else with
+ * HTTP 400 "The 'X' model is not supported when using Codex with a ChatGPT
+ * account." The old catalog fetched the ChatGPT web-app list
+ * (/backend-api/models), whose hyphenated slugs (e.g. `gpt-5-6-thinking`) are
+ * ALL rejected — authenticated users could not chat. Migrate any
+ * non-entitled chatgptWeb model to the current recommended Codex slug.
+ */
+const CHATGPT_CODEX_MODEL_SLUGS = [
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  'gpt-5.5',
+  'gpt-6-astra',
+  'gpt-reserve',
+] as const;
+
+const DEFAULT_CHATGPT_CODEX_MODEL = 'gpt-5.6-sol';
+
+export function migrateLegacyChatGPTModel(config: MercuryConfig): MercuryConfig {
+  const chatgpt = config.providers?.chatgptWeb;
+  if (chatgpt?.enabled && !((CHATGPT_CODEX_MODEL_SLUGS as readonly string[]).includes(chatgpt.model))) {
+    logger.warn({ staleModel: chatgpt.model, replacement: DEFAULT_CHATGPT_CODEX_MODEL }, 'chatgptWeb model not entitled on the Codex backend — migrating');
+    chatgpt.model = DEFAULT_CHATGPT_CODEX_MODEL;
+  }
+  return config;
+}
+
+export function normalizeCloudConfig(config: MercuryConfig): MercuryConfig {
+  // Single source of truth: cloud.apiUrl/wsUrl define the Mercury Cloud backend.
+  // providers.mercuryCloud.baseUrl is derived for the OpenAI-compatible client.
+  if (!config.cloud.apiUrl || config.cloud.apiUrl === LEGACY_SEED_API_URL) {
+    config.cloud.apiUrl = MERCURY_CLOUD_API_URL;
+  }
+  if (config.cloud.wsUrl === LEGACY_SEED_WS_URL) {
+    config.cloud.wsUrl = MERCURY_CLOUD_WS_URL;
+  }
+  if (!config.cloud.wsUrl) config.cloud.wsUrl = deriveCloudWsUrl(config.cloud.apiUrl);
+  config.providers.mercuryCloud.baseUrl = config.cloud.apiUrl;
+  if (config.cloud.accessKey) {
+    config.providers.mercuryCloud.apiKey = config.cloud.accessKey;
+  } else if (config.cloud.jwt && !config.providers.mercuryCloud.apiKey) {
+    config.providers.mercuryCloud.apiKey = config.cloud.jwt;
+  }
+  return config;
+}
+
+function deriveCloudWsUrl(apiUrl: string): string {
+  try {
+    const url = new URL(apiUrl);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.pathname = `${url.pathname.replace(/\/$/, '')}/ws`;
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return MERCURY_CLOUD_WS_URL;
+  }
+}
+
+export function saveConfig(config: MercuryConfig): void {
+  const lockFd = acquireConfigLock();
+  try {
+    saveConfigUnlocked(config);
+  } finally {
+    releaseConfigLock(lockFd);
+  }
+}
+
+export function updateConfig(mutator: (config: MercuryConfig) => void): MercuryConfig {
+  const lockFd = acquireConfigLock();
+  try {
+    const config = loadConfig();
+    mutator(config);
+    saveConfigUnlocked(config);
+    return config;
+  } finally {
+    releaseConfigLock(lockFd);
+  }
+}
+
+function saveConfigUnlocked(config: MercuryConfig): void {
+  config = normalizeCloudConfig(config);
+  const dir = getMercuryHome();
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+  const tempPath = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tempPath, stringifyYaml(config), { encoding: 'utf-8', mode: 0o600 });
+    renameSync(tempPath, CONFIG_PATH);
+  } finally {
+    try { unlinkSync(tempPath); } catch {}
+  }
+  // The config file contains live JWTs and refresh tokens. Restrict to the
+  // owner so other users on shared servers cannot read or rotate them.
+  try { chmodSync(CONFIG_PATH, 0o600); } catch {}
+}
+
+function acquireConfigLock(): number {
+  const dir = getMercuryHome();
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const deadline = Date.now() + 2_000;
+  const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
+
+  while (true) {
+    try {
+      const fd = openSync(CONFIG_LOCK_PATH, 'wx', 0o600);
+      writeFileSync(fd, String(process.pid), 'utf-8');
+      return fd;
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') throw error;
+      let ownerPid = 0;
+      try { ownerPid = parseInt(readFileSync(CONFIG_LOCK_PATH, 'utf-8'), 10); } catch {}
+      let ownerAlive = false;
+      if (ownerPid > 0) {
+        try { process.kill(ownerPid, 0); ownerAlive = true; } catch {}
+      }
+      if (ownerAlive) {
+        if (Date.now() >= deadline) {
+          throw new Error(`Mercury configuration is still being updated by process ${ownerPid}; retry the command`);
+        }
+        Atomics.wait(waitBuffer, 0, 0, 25);
+        continue;
+      }
+      try { unlinkSync(CONFIG_LOCK_PATH); } catch {}
+    }
+  }
+}
+
+function releaseConfigLock(fd: number): void {
+  try { closeSync(fd); } catch {}
+  try { unlinkSync(CONFIG_LOCK_PATH); } catch {}
+}
+
+export function isSetupComplete(): boolean {
+  if (!existsSync(CONFIG_PATH)) return false;
+  const config = loadConfig();
+  return config.identity.owner.length > 0;
+}
+
+export function ensureCreatorField(config: MercuryConfig): MercuryConfig {
+  if (!config.identity.creator && config.identity.owner) {
+    config.identity.creator = 'Cosmic Stack';
+    saveConfig(config);
+  }
+  return config;
+}
+
+function deepMerge<T extends Record<string, any>>(target: T, source: Partial<T>): T {
+  const result = { ...target };
+  for (const key in source) {
+    if (source[key] !== undefined && source[key] !== null) {
+      if (
+        typeof source[key] === 'object' &&
+        !Array.isArray(source[key]) &&
+        typeof target[key] === 'object' &&
+        !Array.isArray(target[key])
+      ) {
+        result[key] = deepMerge(
+          target[key] as Record<string, any>,
+          source[key] as Record<string, any>
+        ) as T[Extract<keyof T, string>];
+      } else {
+        result[key] = source[key] as T[Extract<keyof T, string>];
+      }
+    }
+  }
+  return result;
+}
+
+export function getActiveProviders(config: MercuryConfig): ProviderConfig[] {
+  return Object.values(config.providers)
+    .filter((p): p is ProviderConfig => typeof p === 'object' && isProviderConfigured(p));
+}
+
+export function isProviderConfigured(provider: ProviderConfig): boolean {
+  if (!provider.enabled) return false;
+  if (provider.name === 'mercuryCloud') {
+    return provider.model.length > 0;
+  }
+  if (provider.name === 'ollamaLocal' || provider.name === 'atomicChat') {
+    return provider.baseUrl.length > 0 && provider.model.length > 0;
+  }
+  if (provider.name === 'ollamaCloud') {
+    return provider.apiKey.length > 0 && provider.baseUrl.length > 0;
+  }
+  if (provider.name === 'atlascloud' || provider.name === 'runcrate' || provider.name === 'cloudgpu') {
+    return provider.apiKey.length > 0 && provider.baseUrl.length > 0 && provider.model.length > 0;
+  }
+  if (provider.name === 'openaiCompat' || provider.name === 'litellm') {
+    return provider.baseUrl.length > 0 && provider.model.length > 0;
+  }
+  if (provider.name === 'lmStudio') {
+    return provider.baseUrl.length > 0 && provider.model.length > 0;
+  }
+  if (provider.name === 'chatgptWeb') {
+    // ChatGPT Web uses browser session auth, not API keys.
+    // Considered "configured" if enabled with a model selected.
+    // Actual session validity is checked at runtime via isAvailable().
+    return provider.model.length > 0;
+  }
+  if (provider.name === 'githubCopilot') {
+    // GitHub Copilot uses GitHub OAuth, not API keys.
+    // Considered "configured" if enabled with a model selected.
+    return provider.model.length > 0;
+  }
+  return provider.apiKey.length > 0;
+}
+
+export function getTelegramApprovedUsers(config: MercuryConfig): TelegramAccessUser[] {
+  return [
+    ...config.channels.telegram.admins,
+    ...config.channels.telegram.members,
+  ];
+}
+
+export function getTelegramApprovedChatIds(config: MercuryConfig): number[] {
+  return [...new Set(getTelegramApprovedUsers(config).map((user) => user.chatId))];
+}
+
+export function getTelegramAdmins(config: MercuryConfig): TelegramAccessUser[] {
+  return config.channels.telegram.admins;
+}
+
+export function getTelegramPendingRequests(config: MercuryConfig): TelegramPendingRequest[] {
+  return config.channels.telegram.pending;
+}
+
+export function findTelegramApprovedUser(config: MercuryConfig, userId: number): TelegramAccessUser | undefined {
+  return getTelegramApprovedUsers(config).find((user) => user.userId === userId);
+}
+
+export function findTelegramAdmin(config: MercuryConfig, userId: number): TelegramAccessUser | undefined {
+  return config.channels.telegram.admins.find((user) => user.userId === userId);
+}
+
+export function findTelegramPendingRequest(config: MercuryConfig, userId: number): TelegramPendingRequest | undefined {
+  return config.channels.telegram.pending.find((request) => request.userId === userId);
+}
+
+export function findTelegramPendingRequestByPairingCode(
+  config: MercuryConfig,
+  pairingCode: string,
+): TelegramPendingRequest | undefined {
+  return config.channels.telegram.pending.find((request) => request.pairingCode === pairingCode);
+}
+
+export function hasTelegramAdmins(config: MercuryConfig): boolean {
+  return config.channels.telegram.admins.length > 0;
+}
+
+export function getTelegramAccessSummary(config: MercuryConfig): string {
+  return `${config.channels.telegram.admins.length} admin${config.channels.telegram.admins.length === 1 ? '' : 's'}, `
+    + `${config.channels.telegram.members.length} member${config.channels.telegram.members.length === 1 ? '' : 's'}, `
+    + `${config.channels.telegram.pending.length} pending`;
+}
+
+export function addTelegramPendingRequest(
+  config: MercuryConfig,
+  request: Omit<TelegramPendingRequest, 'requestedAt'> & { requestedAt?: string },
+): TelegramPendingRequest {
+  const existing = findTelegramPendingRequest(config, request.userId);
+  if (existing) {
+    existing.chatId = request.chatId;
+    existing.username = request.username || existing.username;
+    existing.firstName = request.firstName || existing.firstName;
+    existing.pairingCode = request.pairingCode || existing.pairingCode;
+    return existing;
+  }
+
+  const created: TelegramPendingRequest = {
+    ...request,
+    requestedAt: request.requestedAt || new Date().toISOString(),
+  };
+  config.channels.telegram.pending.push(created);
+  return created;
+}
+
+export function approveTelegramPendingRequest(
+  config: MercuryConfig,
+  userId: number,
+  role: 'admin' | 'member' = 'member',
+): TelegramAccessUser | null {
+  const request = findTelegramPendingRequest(config, userId);
+  if (!request) return null;
+
+  const approvedUser: TelegramAccessUser = {
+    userId: request.userId,
+    chatId: request.chatId,
+    username: request.username,
+    firstName: request.firstName,
+    requestedAt: request.requestedAt,
+    approvedAt: new Date().toISOString(),
+  };
+
+  config.channels.telegram.pending = config.channels.telegram.pending
+    .filter((entry) => entry.userId !== userId);
+  config.channels.telegram.admins = config.channels.telegram.admins
+    .filter((entry) => entry.userId !== userId);
+  config.channels.telegram.members = config.channels.telegram.members
+    .filter((entry) => entry.userId !== userId);
+
+  if (role === 'admin') {
+    config.channels.telegram.admins.push(approvedUser);
+  } else {
+    config.channels.telegram.members.push(approvedUser);
+  }
+
+  return approvedUser;
+}
+
+export function approveTelegramPendingRequestByPairingCode(
+  config: MercuryConfig,
+  pairingCode: string,
+): TelegramAccessUser | null {
+  const request = findTelegramPendingRequestByPairingCode(config, pairingCode);
+  if (!request) return null;
+  const role = hasTelegramAdmins(config) ? 'member' : 'admin';
+  return approveTelegramPendingRequest(config, request.userId, role);
+}
+
+export function rejectTelegramPendingRequest(config: MercuryConfig, userId: number): TelegramPendingRequest | null {
+  const request = findTelegramPendingRequest(config, userId);
+  if (!request) return null;
+  config.channels.telegram.pending = config.channels.telegram.pending
+    .filter((entry) => entry.userId !== userId);
+  return request;
+}
+
+export function removeTelegramUser(config: MercuryConfig, userId: number): TelegramAccessUser | null {
+  const admin = config.channels.telegram.admins.find((entry) => entry.userId === userId);
+  if (admin) {
+    config.channels.telegram.admins = config.channels.telegram.admins
+      .filter((entry) => entry.userId !== userId);
+    return admin;
+  }
+
+  const member = config.channels.telegram.members.find((entry) => entry.userId === userId);
+  if (member) {
+    config.channels.telegram.members = config.channels.telegram.members
+      .filter((entry) => entry.userId !== userId);
+    return member;
+  }
+
+  return null;
+}
+
+export function promoteTelegramUserToAdmin(config: MercuryConfig, userId: number): TelegramAccessUser | null {
+  const member = config.channels.telegram.members.find((entry) => entry.userId === userId);
+  if (!member) return null;
+  config.channels.telegram.members = config.channels.telegram.members
+    .filter((entry) => entry.userId !== userId);
+  config.channels.telegram.admins.push(member);
+  return member;
+}
+
+export function demoteTelegramAdmin(config: MercuryConfig, userId: number): TelegramAccessUser | null {
+  if (config.channels.telegram.admins.length <= 1) {
+    return null;
+  }
+
+  const admin = config.channels.telegram.admins.find((entry) => entry.userId === userId);
+  if (!admin) return null;
+  config.channels.telegram.admins = config.channels.telegram.admins
+    .filter((entry) => entry.userId !== userId);
+  config.channels.telegram.members.push(admin);
+  return admin;
+}
+
+export function clearTelegramAccess(config: MercuryConfig): MercuryConfig {
+  config.channels.telegram.admins = [];
+  config.channels.telegram.members = [];
+  config.channels.telegram.pending = [];
+  delete config.channels.telegram.pairedUserId;
+  delete config.channels.telegram.pairedChatId;
+  delete config.channels.telegram.pairedUsername;
+  return config;
+}
+
+export function clearTelegramPairing(config: MercuryConfig): MercuryConfig {
+  return clearTelegramAccess(config);
+}
+
+export function migrateLegacyTelegramAccess(config: MercuryConfig): MercuryConfig {
+  const telegram = config.channels.telegram;
+  telegram.admins = telegram.admins || [];
+  telegram.members = telegram.members || [];
+  telegram.pending = telegram.pending || [];
+
+  if (
+    telegram.admins.length === 0
+    && telegram.members.length === 0
+    && typeof telegram.pairedUserId === 'number'
+    && typeof telegram.pairedChatId === 'number'
+  ) {
+    telegram.admins.push({
+      userId: telegram.pairedUserId,
+      chatId: telegram.pairedChatId,
+      username: telegram.pairedUsername,
+      approvedAt: new Date().toISOString(),
+    });
+  }
+
+  delete telegram.pairedUserId;
+  delete telegram.pairedChatId;
+  delete telegram.pairedUsername;
+
+  return config;
+}
+
+export function migrateLegacyOllamaCloudBaseUrl(config: MercuryConfig): MercuryConfig {
+  if (config.providers.ollamaCloud.baseUrl === 'https://ollama.com/api') {
+    config.providers.ollamaCloud.baseUrl = 'https://ollama.com/v1';
+    saveConfig(config);
+  }
+  return config;
+}
+
+/**
+ * Migrate local Ollama base URL from the legacy /api endpoint to /v1.
+ * Ollama has supported /v1 (OpenAI-compatible) since v0.1.14, and the
+ * /api endpoint is incompatible with AI SDK v6+ when used through
+ * ollama-ai-provider (which declares spec version v1).
+ */
+export function migrateLegacyOllamaLocalBaseUrl(config: MercuryConfig): MercuryConfig {
+  const local = config.providers.ollamaLocal.baseUrl;
+  if (local === 'http://127.0.0.1:11434/api' || local === 'http://localhost:11434/api') {
+    config.providers.ollamaLocal.baseUrl = local.replace('/api', '/v1');
+    saveConfig(config);
+  }
+  return config;
+}
+
+// ── Signal access helpers ────────────────────────────────────────
+
+export function getSignalApprovedUsers(config: MercuryConfig): SignalAccessUser[] {
+  return [...config.channels.signal.admins, ...config.channels.signal.members];
+}
+
+export function findSignalAdmin(config: MercuryConfig, phoneNumber: string): SignalAccessUser | undefined {
+  return config.channels.signal.admins.find((u) => u.phoneNumber === phoneNumber);
+}
+
+export function findSignalApprovedUser(config: MercuryConfig, phoneNumber: string): SignalAccessUser | undefined {
+  return getSignalApprovedUsers(config).find((u) => u.phoneNumber === phoneNumber);
+}
+
+export function findSignalPendingRequest(config: MercuryConfig, phoneNumber: string): SignalPendingRequest | undefined {
+  return config.channels.signal.pending.find((r) => r.phoneNumber === phoneNumber);
+}
+
+export function findSignalPendingRequestByPairingCode(config: MercuryConfig, pairingCode: string): SignalPendingRequest | undefined {
+  return config.channels.signal.pending.find((r) => r.pairingCode === pairingCode);
+}
+
+export function hasSignalAdmins(config: MercuryConfig): boolean {
+  return config.channels.signal.admins.length > 0;
+}
+
+export function getSignalAccessSummary(config: MercuryConfig): string {
+  return `${config.channels.signal.admins.length} admin${config.channels.signal.admins.length === 1 ? '' : 's'}, `
+    + `${config.channels.signal.members.length} member${config.channels.signal.members.length === 1 ? '' : 's'}, `
+    + `${config.channels.signal.pending.length} pending`;
+}
+
+export function addSignalPendingRequest(
+  config: MercuryConfig,
+  request: Omit<SignalPendingRequest, 'requestedAt'> & { requestedAt?: string },
+): SignalPendingRequest {
+  const existing = findSignalPendingRequest(config, request.phoneNumber);
+  if (existing) {
+    existing.pairingCode = request.pairingCode || existing.pairingCode;
+    if (request.uuid) existing.uuid = request.uuid;
+    if (request.name) existing.name = request.name;
+    return existing;
+  }
+
+  const created: SignalPendingRequest = {
+    ...request,
+    requestedAt: request.requestedAt || new Date().toISOString(),
+  };
+  config.channels.signal.pending.push(created);
+  return created;
+}
+
+export function approveSignalPendingRequest(
+  config: MercuryConfig,
+  phoneNumber: string,
+  role: 'admin' | 'member' = 'member',
+): SignalAccessUser | null {
+  const request = findSignalPendingRequest(config, phoneNumber);
+  if (!request) return null;
+
+  const approvedUser: SignalAccessUser = {
+    phoneNumber: request.phoneNumber,
+    role,
+    pairedAt: new Date().toISOString(),
+  };
+
+  config.channels.signal.pending = config.channels.signal.pending
+    .filter((r) => r.phoneNumber !== phoneNumber);
+  config.channels.signal.admins = config.channels.signal.admins
+    .filter((u) => u.phoneNumber !== phoneNumber);
+  config.channels.signal.members = config.channels.signal.members
+    .filter((u) => u.phoneNumber !== phoneNumber);
+
+  if (role === 'admin') {
+    config.channels.signal.admins.push(approvedUser);
+  } else {
+    config.channels.signal.members.push(approvedUser);
+  }
+
+  return approvedUser;
+}
+
+export function approveSignalPendingRequestByPairingCode(
+  config: MercuryConfig,
+  pairingCode: string,
+): SignalAccessUser | null {
+  const request = findSignalPendingRequestByPairingCode(config, pairingCode);
+  if (!request) return null;
+  const role = hasSignalAdmins(config) ? 'member' : 'admin';
+  return approveSignalPendingRequest(config, request.phoneNumber, role);
+}
+
+export function rejectSignalPendingRequest(config: MercuryConfig, phoneNumber: string): SignalPendingRequest | null {
+  const request = findSignalPendingRequest(config, phoneNumber);
+  if (!request) return null;
+  config.channels.signal.pending = config.channels.signal.pending
+    .filter((r) => r.phoneNumber !== phoneNumber);
+  return request;
+}
+
+export function clearSignalAccess(config: MercuryConfig): MercuryConfig {
+  config.channels.signal.admins = [];
+  config.channels.signal.members = [];
+  config.channels.signal.pending = [];
+  delete config.channels.signal.groupId;
+  delete config.channels.signal.groupName;
+  return config;
+}
+
+export function migrateLegacySignalAccess(config: MercuryConfig): MercuryConfig {
+  const signal = config.channels.signal;
+  if (!signal) return config;
+  signal.admins = signal.admins || [];
+  signal.members = signal.members || [];
+  signal.pending = signal.pending || [];
+  return config;
+}
+
+// ── Discord access helpers ────────────────────────────────────────
+
+export function getDiscordApprovedUsers(config: MercuryConfig): DiscordAccessUser[] {
+  return [...config.channels.discord.admins, ...config.channels.discord.members];
+}
+
+export function getDiscordAdmins(config: MercuryConfig): DiscordAccessUser[] {
+  return config.channels.discord.admins;
+}
+
+export function getDiscordPendingRequests(config: MercuryConfig): DiscordPendingRequest[] {
+  return config.channels.discord.pending;
+}
+
+export function findDiscordApprovedUser(config: MercuryConfig, userId: string): DiscordAccessUser | undefined {
+  return getDiscordApprovedUsers(config).find((u) => u.userId === userId);
+}
+
+export function findDiscordAdmin(config: MercuryConfig, userId: string): DiscordAccessUser | undefined {
+  return config.channels.discord.admins.find((u) => u.userId === userId);
+}
+
+export function findDiscordPendingRequest(config: MercuryConfig, userId: string): DiscordPendingRequest | undefined {
+  return config.channels.discord.pending.find((r) => r.userId === userId);
+}
+
+export function findDiscordPendingRequestByPairingCode(config: MercuryConfig, pairingCode: string): DiscordPendingRequest | undefined {
+  return config.channels.discord.pending.find((r) => r.pairingCode === pairingCode);
+}
+
+export function hasDiscordAdmins(config: MercuryConfig): boolean {
+  return config.channels.discord.admins.length > 0;
+}
+
+export function getDiscordAccessSummary(config: MercuryConfig): string {
+  return `${config.channels.discord.admins.length} admin${config.channels.discord.admins.length === 1 ? '' : 's'}, `
+    + `${config.channels.discord.members.length} member${config.channels.discord.members.length === 1 ? '' : 's'}, `
+    + `${config.channels.discord.pending.length} pending`;
+}
+
+export function addDiscordPendingRequest(
+  config: MercuryConfig,
+  request: Omit<DiscordPendingRequest, 'requestedAt'> & { requestedAt?: string },
+): DiscordPendingRequest {
+  const existing = findDiscordPendingRequest(config, request.userId);
+  if (existing) {
+    existing.username = request.username || existing.username;
+    existing.displayName = request.displayName || existing.displayName;
+    existing.pairingCode = request.pairingCode || existing.pairingCode;
+    return existing;
+  }
+
+  const created: DiscordPendingRequest = {
+    ...request,
+    requestedAt: request.requestedAt || new Date().toISOString(),
+  };
+  config.channels.discord.pending.push(created);
+  return created;
+}
+
+export function approveDiscordPendingRequest(
+  config: MercuryConfig,
+  userId: string,
+  role: 'admin' | 'member' = 'member',
+): DiscordAccessUser | null {
+  const request = findDiscordPendingRequest(config, userId);
+  if (!request) return null;
+
+  const approvedUser: DiscordAccessUser = {
+    userId: request.userId,
+    username: request.username,
+    displayName: request.displayName,
+    role,
+    approvedAt: new Date().toISOString(),
+  };
+
+  config.channels.discord.pending = config.channels.discord.pending
+    .filter((r) => r.userId !== userId);
+  config.channels.discord.admins = config.channels.discord.admins
+    .filter((u) => u.userId !== userId);
+  config.channels.discord.members = config.channels.discord.members
+    .filter((u) => u.userId !== userId);
+
+  if (role === 'admin') {
+    config.channels.discord.admins.push(approvedUser);
+  } else {
+    config.channels.discord.members.push(approvedUser);
+  }
+
+  return approvedUser;
+}
+
+export function approveDiscordPendingRequestByPairingCode(
+  config: MercuryConfig,
+  pairingCode: string,
+): DiscordAccessUser | null {
+  const request = findDiscordPendingRequestByPairingCode(config, pairingCode);
+  if (!request) return null;
+  const role = hasDiscordAdmins(config) ? 'member' : 'admin';
+  return approveDiscordPendingRequest(config, request.userId, role);
+}
+
+export function rejectDiscordPendingRequest(config: MercuryConfig, userId: string): DiscordPendingRequest | null {
+  const request = findDiscordPendingRequest(config, userId);
+  if (!request) return null;
+  config.channels.discord.pending = config.channels.discord.pending
+    .filter((r) => r.userId !== userId);
+  return request;
+}
+
+export function removeDiscordUser(config: MercuryConfig, userId: string): DiscordAccessUser | null {
+  const admin = config.channels.discord.admins.find((u) => u.userId === userId);
+  if (admin) {
+    config.channels.discord.admins = config.channels.discord.admins
+      .filter((u) => u.userId !== userId);
+    return admin;
+  }
+
+  const member = config.channels.discord.members.find((u) => u.userId === userId);
+  if (member) {
+    config.channels.discord.members = config.channels.discord.members
+      .filter((u) => u.userId !== userId);
+    return member;
+  }
+
+  return null;
+}
+
+export function promoteDiscordUserToAdmin(config: MercuryConfig, userId: string): DiscordAccessUser | null {
+  const member = config.channels.discord.members.find((u) => u.userId === userId);
+  if (!member) return null;
+  config.channels.discord.members = config.channels.discord.members
+    .filter((u) => u.userId !== userId);
+  config.channels.discord.admins.push(member);
+  return member;
+}
+
+export function demoteDiscordAdmin(config: MercuryConfig, userId: string): DiscordAccessUser | null {
+  if (config.channels.discord.admins.length <= 1) {
+    return null;
+  }
+
+  const admin = config.channels.discord.admins.find((u) => u.userId === userId);
+  if (!admin) return null;
+  config.channels.discord.admins = config.channels.discord.admins
+    .filter((u) => u.userId !== userId);
+  config.channels.discord.members.push(admin);
+  return admin;
+}
+
+export function clearDiscordAccess(config: MercuryConfig): MercuryConfig {
+  config.channels.discord.admins = [];
+  config.channels.discord.members = [];
+  config.channels.discord.pending = [];
+  return config;
+}
+
+export function migrateLegacyDiscordAccess(config: MercuryConfig): MercuryConfig {
+  const discord = config.channels.discord;
+  if (!discord) return config;
+  discord.admins = discord.admins || [];
+  discord.members = discord.members || [];
+  discord.pending = discord.pending || [];
+  return config;
+}
+
+// ── Slack access helpers ──────────────────────────────────────────
+
+export function getSlackApprovedUsers(config: MercuryConfig): SlackAccessUser[] {
+  return [...config.channels.slack.admins, ...config.channels.slack.members];
+}
+
+export function getSlackAdmins(config: MercuryConfig): SlackAccessUser[] {
+  return config.channels.slack.admins;
+}
+
+export function getSlackPendingRequests(config: MercuryConfig): SlackPendingRequest[] {
+  return config.channels.slack.pending;
+}
+
+export function findSlackApprovedUser(config: MercuryConfig, userId: string): SlackAccessUser | undefined {
+  return getSlackApprovedUsers(config).find((u) => u.userId === userId);
+}
+
+export function findSlackAdmin(config: MercuryConfig, userId: string): SlackAccessUser | undefined {
+  return config.channels.slack.admins.find((u) => u.userId === userId);
+}
+
+export function findSlackPendingRequest(config: MercuryConfig, userId: string): SlackPendingRequest | undefined {
+  return config.channels.slack.pending.find((r) => r.userId === userId);
+}
+
+export function findSlackPendingRequestByPairingCode(config: MercuryConfig, pairingCode: string): SlackPendingRequest | undefined {
+  return config.channels.slack.pending.find((r) => r.pairingCode === pairingCode);
+}
+
+export function hasSlackAdmins(config: MercuryConfig): boolean {
+  return config.channels.slack.admins.length > 0;
+}
+
+export function getSlackAccessSummary(config: MercuryConfig): string {
+  return `${config.channels.slack.admins.length} admin${config.channels.slack.admins.length === 1 ? '' : 's'}, `
+    + `${config.channels.slack.members.length} member${config.channels.slack.members.length === 1 ? '' : 's'}, `
+    + `${config.channels.slack.pending.length} pending`;
+}
+
+export function addSlackPendingRequest(
+  config: MercuryConfig,
+  request: Omit<SlackPendingRequest, 'requestedAt'> & { requestedAt?: string },
+): SlackPendingRequest {
+  const existing = findSlackPendingRequest(config, request.userId);
+  if (existing) {
+    existing.userName = request.userName || existing.userName;
+    existing.displayName = request.displayName || existing.displayName;
+    existing.pairingCode = request.pairingCode || existing.pairingCode;
+    return existing;
+  }
+
+  const created: SlackPendingRequest = {
+    ...request,
+    requestedAt: request.requestedAt || new Date().toISOString(),
+  };
+  config.channels.slack.pending.push(created);
+  return created;
+}
+
+export function approveSlackPendingRequest(
+  config: MercuryConfig,
+  userId: string,
+  role: 'admin' | 'member' = 'member',
+): SlackAccessUser | null {
+  const request = findSlackPendingRequest(config, userId);
+  if (!request) return null;
+
+  const approvedUser: SlackAccessUser = {
+    userId: request.userId,
+    userName: request.userName,
+    displayName: request.displayName,
+    role,
+    approvedAt: new Date().toISOString(),
+  };
+
+  config.channels.slack.pending = config.channels.slack.pending
+    .filter((r) => r.userId !== userId);
+  config.channels.slack.admins = config.channels.slack.admins
+    .filter((u) => u.userId !== userId);
+  config.channels.slack.members = config.channels.slack.members
+    .filter((u) => u.userId !== userId);
+
+  if (role === 'admin') {
+    config.channels.slack.admins.push(approvedUser);
+  } else {
+    config.channels.slack.members.push(approvedUser);
+  }
+
+  return approvedUser;
+}
+
+export function approveSlackPendingRequestByPairingCode(
+  config: MercuryConfig,
+  pairingCode: string,
+): SlackAccessUser | null {
+  const request = findSlackPendingRequestByPairingCode(config, pairingCode);
+  if (!request) return null;
+  const role = hasSlackAdmins(config) ? 'member' : 'admin';
+  return approveSlackPendingRequest(config, request.userId, role);
+}
+
+export function rejectSlackPendingRequest(config: MercuryConfig, userId: string): SlackPendingRequest | null {
+  const request = findSlackPendingRequest(config, userId);
+  if (!request) return null;
+  config.channels.slack.pending = config.channels.slack.pending
+    .filter((r) => r.userId !== userId);
+  return request;
+}
+
+export function removeSlackUser(config: MercuryConfig, userId: string): SlackAccessUser | null {
+  const admin = config.channels.slack.admins.find((u) => u.userId === userId);
+  if (admin) {
+    config.channels.slack.admins = config.channels.slack.admins
+      .filter((u) => u.userId !== userId);
+    return admin;
+  }
+
+  const member = config.channels.slack.members.find((u) => u.userId === userId);
+  if (member) {
+    config.channels.slack.members = config.channels.slack.members
+      .filter((u) => u.userId !== userId);
+    return member;
+  }
+
+  return null;
+}
+
+export function promoteSlackUserToAdmin(config: MercuryConfig, userId: string): SlackAccessUser | null {
+  const member = config.channels.slack.members.find((u) => u.userId === userId);
+  if (!member) return null;
+  config.channels.slack.members = config.channels.slack.members
+    .filter((u) => u.userId !== userId);
+  config.channels.slack.admins.push(member);
+  return member;
+}
+
+export function demoteSlackAdmin(config: MercuryConfig, userId: string): SlackAccessUser | null {
+  if (config.channels.slack.admins.length <= 1) {
+    return null;
+  }
+
+  const admin = config.channels.slack.admins.find((u) => u.userId === userId);
+  if (!admin) return null;
+  config.channels.slack.admins = config.channels.slack.admins
+    .filter((u) => u.userId !== userId);
+  config.channels.slack.members.push(admin);
+  return admin;
+}
+
+export function clearSlackAccess(config: MercuryConfig): MercuryConfig {
+  config.channels.slack.admins = [];
+  config.channels.slack.members = [];
+  config.channels.slack.pending = [];
+  return config;
+}
+
+export function migrateLegacySlackAccess(config: MercuryConfig): MercuryConfig {
+  const slack = config.channels.slack;
+  if (!slack) return config;
+  slack.admins = slack.admins || [];
+  slack.members = slack.members || [];
+  slack.pending = slack.pending || [];
+  return config;
+}

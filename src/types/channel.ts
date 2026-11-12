@@ -1,0 +1,162 @@
+export interface TelegramAccessUser {
+  userId: number;
+  chatId: number;
+  username?: string;
+  firstName?: string;
+  requestedAt?: string;
+  approvedAt: string;
+}
+
+export interface TelegramPendingRequest {
+  userId: number;
+  chatId: number;
+  username?: string;
+  firstName?: string;
+  requestedAt: string;
+  pairingCode?: string;
+}
+
+export type ChannelType = 'cli' | 'telegram' | 'web' | 'internal' | 'signal' | 'discord' | 'slack' | 'whatsapp' | 'desktop';
+
+export interface ChannelMessage {
+  id: string;
+  channelId: string;
+  channelType: ChannelType;
+  senderId: string;
+  senderName?: string;
+  /**
+   * Role of the sender on the originating channel, when the channel can
+   * distinguish it (e.g. Telegram admins vs approved members). Undefined for
+   * channels that have no notion of roles (CLI, internal). Used to keep
+   * admin-only capabilities (such as installing skills) out of the tool set
+   * exposed to non-admin chat participants.
+   */
+  senderRole?: "admin" | "member";
+  content: string;
+  timestamp: number;
+  /** Canonical local session identity; channelId remains transport-specific. */
+  sessionId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * A file the owner attached to a message. The runtime reads `path` at turn time
+ * and hands images/PDFs to the model when it can take them. TXT and Markdown
+ * are included as bounded text for every model (`src/core/attachments.ts`).
+ */
+export interface ChannelAttachment {
+  /** `image` and `document` are the kinds the runtime can hand to a model. */
+  kind: 'image' | 'document';
+  path: string;
+  mime?: string;
+  name?: string;
+}
+
+export interface ChannelConfig {
+  type: ChannelType;
+  enabled: boolean;
+  [key: string]: unknown;
+}
+
+export interface TelegramChannelConfig extends ChannelConfig {
+  type: 'telegram';
+  botToken: string;
+  webhookUrl?: string;
+  allowedChatIds?: number[];
+  streaming?: boolean;
+  admins?: TelegramAccessUser[];
+  members?: TelegramAccessUser[];
+  pending?: TelegramPendingRequest[];
+  pairedUserId?: number;
+  pairedChatId?: number;
+  pairedUsername?: string;
+}
+
+export interface CLIChannelConfig extends ChannelConfig {
+  type: 'cli';
+}
+
+export type SignalMode = 'private' | 'group';
+
+export interface SignalAccessUser {
+  phoneNumber: string;
+  uuid?: string;
+  name?: string;
+  role: 'admin' | 'member';
+  pairedAt: string;
+}
+
+export interface SignalPendingRequest {
+  phoneNumber: string;
+  pairingCode: string;
+  requestedAt: string;
+  uuid?: string;
+  name?: string;
+}
+
+export interface SignalChannelConfig extends ChannelConfig {
+  type: 'signal';
+  phoneNumber: string;
+  mode: SignalMode;
+  groupId?: string;
+  groupName?: string;
+  admins: SignalAccessUser[];
+  members: SignalAccessUser[];
+  pending: SignalPendingRequest[];
+}
+
+export interface DiscordAccessUser {
+  userId: string;
+  username?: string;
+  displayName?: string;
+  role: 'admin' | 'member';
+  approvedAt: string;
+}
+
+export interface DiscordPendingRequest {
+  userId: string;
+  username?: string;
+  displayName?: string;
+  requestedAt: string;
+  pairingCode?: string;
+}
+
+export interface DiscordChannelConfig extends ChannelConfig {
+  type: 'discord';
+  botToken: string;
+  guildId?: string;
+  channelId?: string;
+  adminRoleName?: string;
+  streaming?: boolean;
+  admins: DiscordAccessUser[];
+  members: DiscordAccessUser[];
+  pending: DiscordPendingRequest[];
+}
+
+export interface SlackAccessUser {
+  userId: string;
+  userName?: string;
+  displayName?: string;
+  role: 'admin' | 'member';
+  approvedAt: string;
+}
+
+export interface SlackPendingRequest {
+  userId: string;
+  userName?: string;
+  displayName?: string;
+  requestedAt: string;
+  pairingCode?: string;
+}
+
+export interface SlackChannelConfig extends ChannelConfig {
+  type: 'slack';
+  botToken: string;
+  appToken: string;
+  channelId?: string;
+  teamId?: string;
+  streaming?: boolean;
+  admins: SlackAccessUser[];
+  members: SlackAccessUser[];
+  pending: SlackPendingRequest[];
+}

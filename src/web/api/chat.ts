@@ -1,0 +1,1095 @@
+import { trackStream } from '../../security/live-streams.js';
+import { isThisComputer, principalKey, principalOf } from '../middleware.js';
+import { requireOwner } from '../owner-gate.js';
+import { protectedReason } from '../../security/protected-paths.js';
+import { Hono } from 'hono';
+import { commandCatalog } from '../../core/commands/catalog.js';
+import { getPluginManager } from '../../plugins/manager.js';
+import { artifactStore } from '../../artifacts/store.js';
+import { favicons } from '../favicons.js';
+import { scopedProgrammingState } from '../../core/programming-mode.js';
+import { isInsideWorkspace } from './workspace-ide.js';
+import { storeInlineAttachments, attachmentRefs, resolveUploadRef, uploadMime } from './uploads.js';
+import type { WebChannel } from '../../channels/web.js';
+import type { ProgrammingMode, ProgrammingModeState } from '../../core/programming-mode.js';
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, rmSync } from 'node:fs';
+import { join, extname, basename, relative, resolve } from 'node:path';
+import { getMercuryHome, loadConfig, getActiveProviders, type ProviderConfig } from '../../utils/config.js';
+import { basicAuthHeaders } from '../../providers/basic-auth.js';
+import type { SessionRepository } from '../../sessions/index.js';
+import { SessionTitleError } from '../../sessions/repository.js';
+import { loadPermissionMode, savePermissionMode } from '../../capabilities/permission-mode-store.js';
+import { discoverReasoningCaps } from '../../providers/reasoning-discovery.js';
+import { mediaService } from '../../media/runtime.js';
+import { isChatModelId } from '../../utils/provider-models.js';
+import {
+  getModelPref, setModelPref, humanizeModelName, modelGroupLabel,
+  reasoningLevelsFor, effectiveReasoning, isReasoningLevel, isValidModelRef, type ReasoningLevel,
+  effortFor, setChatEffort,
+} from '../../utils/model-prefs.js';
+
+let webChannel: WebChannel | null = null;
+let programmingMode: ProgrammingMode | null = null;
+let modelSwitchFn: ((provider: string, model?: string) => Promise<{ ok: boolean; message: string }>) | null = null;
+let currentProviderFn: (() => { name: string; model: string }) | null = null;
+let sessions: SessionRepository | null = null;
+let sessionSyncEnabledFn: (() => boolean) | null = null;
+
+export function setSessionRepository(repository: SessionRepository): void {
+  sessions = repository;
+}
+
+export function setSessionSyncEnabledCallback(fn: () => boolean): void {
+  sessionSyncEnabledFn = fn;
+}
+
+/**
+ * What one reply cost (#296: every step of its turn), from what the turn
+ * recorded: tokens in (and how many came from the prompt cache), tokens out,
+ * steps, time and the model. Nothing for replies recorded before usage was.
+ */
+function usageOf(meta: Record<string, unknown> | undefined): { usage?: { provider?: string; model?: string; inputTokens: number; cachedInputTokens: number; outputTokens: number; steps?: number; elapsedMs?: number } } {
+  if (!meta || typeof meta.inputTokens !== 'number' || typeof meta.outputTokens !== 'number') return {};
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined);
+  return {
+    usage: {
+      ...(typeof meta.provider === 'string' ? { provider: meta.provider } : {}),
+      ...(typeof meta.model === 'string' ? { model: meta.model } : {}),
+      inputTokens: num(meta.inputTokens) ?? 0,
+      cachedInputTokens: num(meta.cachedInputTokens) ?? 0,
+      outputTokens: num(meta.outputTokens) ?? 0,
+      ...(num(meta.steps) !== undefined ? { steps: num(meta.steps) } : {}),
+      ...(num(meta.elapsedMs) !== undefined ? { elapsedMs: num(meta.elapsedMs) } : {}),
+    },
+  };
+}
+
+function toThread(session: ReturnType<SessionRepository['get']>, includeMessages = true) {
+  return {
+    id: session.id,
+    shortId: session.shortId,
+    alias: session.alias,
+    title: session.title,
+    // A desktop voice call saved as a thread (voice-calls.ts).
+    voiceCall: typeof session.messages[0]?.metadata?.voiceCall === 'string',
+    ...(session.savedAt ? { savedAt: new Date(session.savedAt).toISOString() } : {}),
+    createdAt: new Date(session.createdAt).toISOString(),
+    updatedAt: new Date(session.updatedAt).toISOString(),
+    messages: includeMessages ? session.messages.map((message) => ({
+      id: message.id,
+      threadId: session.id,
+      role: message.role,
+      content: message.content,
+      timestamp: new Date(message.timestamp).toISOString(),
+      kind: message.kind,
+      sequence: message.sequence,
+      ...(typeof message.metadata?.voiceRole === 'string' ? { voice: message.metadata.voiceRole } : {}),
+      ...(Array.isArray(message.metadata?.artifacts) && message.metadata.artifacts.length ? { artifacts: message.metadata.artifacts } : {}),
+      ...(message.metadata?.research && typeof message.metadata.research === 'object' ? { research: message.metadata.research } : {}),
+      ...(message.role === 'assistant' ? usageOf(message.metadata) : {}),
+      ...(message.role === 'assistant' && message.metadata?.trace && typeof message.metadata.trace === 'object' ? { trace: message.metadata.trace } : {}),
+      ...(Array.isArray(message.metadata?.attachments) && message.metadata.attachments.length > 0
+        ? { attachments: (message.metadata.attachments as Array<{ name: string; kind: string; mime?: string; ref: string }>).map((a) => ({ name: a.name, kind: a.kind, mime: a.mime, url: `/api/chat/uploads/${a.ref}` })) }
+        : {}),
+    })) : [],
+  };
+}
+
+export function setProgrammingMode(pm: ProgrammingMode): void {
+  programmingMode = pm;
+}
+
+export function setModelSwitchCallback(fn: (provider: string, model?: string) => Promise<{ ok: boolean; message: string }>): void {
+  modelSwitchFn = fn;
+}
+
+export function setCurrentProviderCallback(fn: () => { name: string; model: string }): void {
+  currentProviderFn = fn;
+}
+
+let stopFn: ((target?: { channelId?: string; sessionId?: string; keepQueued?: boolean }) => Promise<string>) | null = null;
+let busyFn: ((sessionId: string) => boolean) | null = null;
+/** Whether a session has a turn running or queued (undo waits for it). */
+export function setSessionBusyLookup(fn: ((sessionId: string) => boolean) | null): void {
+  busyFn = fn;
+}
+type QueueState = { state: 'running' | 'queued' | 'none'; position?: number; busyWith?: string; busySessionId?: string };
+let queueControls: { state: (threadId: string) => QueueState; prioritize: (threadId: string) => number } | null = null;
+/** The agent's line of turns: where a chat stands, and moving one to the front ("do mine first"). */
+export function setQueueControls(controls: typeof queueControls): void {
+  queueControls = controls;
+}
+
+/** A chat a turn runs or waits in, as screens see it (ADR-037). */
+export interface TurnChat {
+  /** The thread/session it belongs to, when it has one (desktop/web chats always do). */
+  sessionId?: string;
+  channelType: string;
+  channelId: string;
+}
+
+/** Chats running at once: what runs, what waits, and the limit (ADR-037). */
+export interface TurnControls {
+  running: () => Array<TurnChat & { startedAt: number; activity: string; steps: number }>;
+  waiting: () => Array<TurnChat & { waiting: number; position: number }>;
+  /** `limit`: in effect now. `configured`: 0 = automatic. `auto`: what automatic gives on this machine. */
+  limit: () => { limit: number; configured: number; auto: number };
+  /** Set the configured limit (0 = automatic); applies at once and persists. */
+  setLimit: (configured: number) => void;
+  /** The reply a chat is working on now, as far as it got (agent.liveTurn). */
+  live?: (id: string) => { startedAt: number; activity: string; trace: unknown } | undefined;
+}
+let turnControls: TurnControls | null = null;
+export function setTurnControls(controls: TurnControls | null): void {
+  turnControls = controls;
+}
+
+function turnsSnapshot(controls: TurnControls) {
+  const label = (activity: string) => activity.replace(/^\W+/u, '').replace(/\s+/g, ' ').trim().slice(0, 90);
+  return {
+    ...controls.limit(),
+    running: controls.running().map((t) => ({ ...t, activity: label(t.activity) })),
+    waiting: controls.waiting(),
+  };
+}
+
+/** Research runs per chat: what's going on, "write the report now". */
+let researchControls: {
+  state: (sessionId: string) => Record<string, unknown>;
+  finish: (sessionId: string) => { ok: boolean; reason?: string };
+  off: (sessionId: string) => void;
+} | null = null;
+export function setResearchControls(controls: typeof researchControls): void {
+  researchControls = controls;
+}
+/**
+ * The same stop the terminal's Esc and `/stop` use: abort the running turn,
+ * cancel its work entry. Given a thread or session, only that chat's work
+ * stops (other chats keep running, ADR-037); given neither, everything does.
+ */
+export function setStopCallback(fn: (target?: { channelId?: string; sessionId?: string; keepQueued?: boolean }) => Promise<string>): void {
+  stopFn = fn;
+}
+
+let statusSnapshotFn: (() => Record<string, unknown>) | null = null;
+
+/** The runtime's live status (model, mode, permissions, tokens…) for the connected frame. */
+export function setStatusSnapshotCallback(fn: () => Record<string, unknown>): void {
+  statusSnapshotFn = fn;
+}
+
+type ChatWebSettings = {
+  bypassPermissions: boolean;
+  restrictUser: boolean;
+  workspace: string;
+};
+
+const CHAT_SETTINGS_FILE = join(getMercuryHome(), 'web-chat-settings.json');
+
+function loadSettings(): ChatWebSettings {
+  if (!existsSync(CHAT_SETTINGS_FILE)) {
+    return { bypassPermissions: false, restrictUser: false, workspace: '' };
+  }
+  try {
+    const raw = JSON.parse(readFileSync(CHAT_SETTINGS_FILE, 'utf8')) as Partial<ChatWebSettings>;
+    return {
+      bypassPermissions: !!raw.bypassPermissions,
+      restrictUser: !!raw.restrictUser,
+      workspace: raw.workspace || '',
+    };
+  } catch {
+    return { bypassPermissions: false, restrictUser: false, workspace: '' };
+  }
+}
+
+function saveSettings(settings: ChatWebSettings): void {
+  writeFileSync(CHAT_SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf8');
+}
+
+export function setWebChannel(ch: WebChannel): void {
+  webChannel = ch;
+  const settings = loadSettings();
+  // The owner's saved permission mode wins; the old per-dashboard flag is
+  // only used until a mode has been chosen.
+  const saved = loadPermissionMode();
+  webChannel.setBypassPermissions(saved ? saved === 'allow-all' : settings.bypassPermissions);
+  webChannel.setRestrictUser(settings.restrictUser);
+}
+
+const chat = new Hono();
+
+// ─── SSE Events ──────────────────────────────────────────────
+
+/** The conversation's latest plan checklist (update_plan), for a client opening the thread. */
+// The "/" picker: every slash command, with what it does (the terminal's list, the manual's words,
+// and the commands running plugins add). Sent as a message, a command runs exactly as typed.
+chat.get('/api/chat/commands', (c) => {
+  let plugins: Array<{ name: string; description: string; plugin: string }> = [];
+  try { plugins = getPluginManager().commandHelp(); } catch { /* plugins not started */ }
+  return c.json({ commands: commandCatalog(plugins) });
+});
+
+chat.get('/api/chat/plan', (c) => {
+  if (!webChannel) return c.json({ plan: null });
+  const id = c.req.query('sessionId');
+  return c.json({ plan: id ? webChannel.plans.get(id) : null });
+});
+
+/**
+ * Activity across every session (started, needs you, done, failed), for
+ * notifications. Prompts asked while this is open wait for the owner.
+ */
+chat.get('/api/chat/activity', (c) => {
+  if (!webChannel) return c.json({ error: 'Web channel not initialized' }, 503);
+  const ch = webChannel;
+  if (sessions) {
+    const repo = sessions;
+    ch.setSessionTitleLookup((id) => { try { return repo.get(id)?.title ?? undefined; } catch { return undefined; } });
+  }
+  const stream = new ReadableStream({
+    start(controller) {
+      const clientId = ch.addActivityClient(controller, isThisComputer(c));
+      const encoder = new TextEncoder();
+      const send = (data: string) => { try { controller.enqueue(encoder.encode(data)); } catch { /* closed */ } };
+      send(`event: connected\ndata: ${JSON.stringify({ id: clientId })}\n\n`);
+      const keepalive = setInterval(() => send(': keepalive\n\n'), 15000);
+      const cleanup = () => { clearInterval(keepalive); ch.removeActivityClient(clientId); untrack(); };
+      // Revoking the device (or signing the browser out) ends this stream at once.
+      const untrack = trackStream(principalKey(principalOf(c)), () => { cleanup(); try { controller.close(); } catch { /* closed */ } });
+      c.req.raw.signal.addEventListener('abort', cleanup);
+    },
+  });
+  return new Response(stream, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' } });
+});
+
+/** Prompts still waiting for an answer in a session (opening it shows them). */
+chat.get('/api/chat/pending', (c) => {
+  if (!webChannel) return c.json({ prompts: [] });
+  const sessionId = c.req.query('sessionId') ?? '';
+  if (!sessionId) return c.json({ prompts: [] });
+  return c.json({ prompts: webChannel.pendingFor(sessionId).map((e) => ({ type: e.type, ...e.data })) });
+});
+
+chat.get('/api/chat/events', (c) => {
+  if (!webChannel) {
+    return c.json({ error: 'Web channel not initialized' }, 503);
+  }
+  const ch = webChannel;
+
+  const stream = new ReadableStream({
+    start(controller) {
+      const clientId = ch.addSSEClient(controller, c.req.query('sessionId'));
+
+      const encoder = new TextEncoder();
+      const send = (data: string) => {
+        try {
+          controller.enqueue(encoder.encode(data));
+        } catch {}
+      };
+
+      // Send connected event with proper SSE named event format
+      const providerInfo = currentProviderFn ? currentProviderFn() : { name: '', model: '' };
+      let status: Record<string, unknown> | undefined;
+      try { status = statusSnapshotFn?.(); } catch { status = undefined; }
+      send(`event: connected\ndata: ${JSON.stringify({ id: clientId, provider: providerInfo.name, model: providerInfo.model, ...(status ? { status } : {}) })}\n\n`);
+
+      const keepalive = setInterval(() => {
+        send(`: keepalive\n\n`);
+      }, 15000);
+
+      const cleanup = () => { clearInterval(keepalive); webChannel?.removeSSEClient(clientId); untrack(); };
+      // Revoking the device (or signing the browser out) ends this stream at once.
+      const untrack = trackStream(principalKey(principalOf(c)), () => { cleanup(); try { controller.close(); } catch { /* closed */ } });
+      c.req.raw.signal.addEventListener('abort', cleanup);
+    },
+    cancel() {},
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    },
+  });
+});
+
+// ─── Send Message ────────────────────────────────────────────
+
+chat.post('/api/chat/send', async (c) => {
+  if (!webChannel) {
+    return c.json({ error: 'Web channel not initialized' }, 503);
+  }
+
+  const body = await c.req.json<{
+    content?: string;
+    sessionId?: string;
+    threadId?: string;
+    /** Base64 files: images, PDFs and UTF-8 text become attachments for this turn. */
+    attachments?: unknown;
+    /** Session-scoped coding: 'auto' | 'plan' | 'execute' for this turn only. */
+    programming?: unknown;
+    /** Folder the coding turn works in (an existing directory). */
+    cwd?: unknown;
+    /** The desktop's Image switch: { kind: "image", aspect? } (ADR-042). */
+    media?: unknown;
+  }>();
+  const content = body.content?.trim() ?? '';
+  const upload = storeInlineAttachments(body.attachments);
+  if (!upload.ok) return c.json({ error: upload.error }, 400);
+  if (!content && upload.attachments.length === 0) {
+    return c.json({ error: 'Message content required' }, 400);
+  }
+
+  try {
+    if (!sessions) return c.json({ error: 'Session repository not initialized' }, 503);
+    const requestedId = body.sessionId?.trim() || body.threadId?.trim();
+    let session = requestedId ? sessions.getByBinding('web', requestedId) : null;
+    if (requestedId && !session) {
+      try {
+        session = sessions.get(requestedId);
+      } catch {
+        session = /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(requestedId)
+          ? sessions.getOrCreateBound('web', requestedId, requestedId)
+          : sessions.getOrCreateBound('web', requestedId);
+      }
+    }
+    session ??= sessions.getOrCreateBound('web', 'web:default');
+    // Models reject an empty text block, so a photo sent alone says what it is.
+    const text = content || `(Attached: ${upload.attachments.map(a => a.name).join(', ')})`;
+    const programming = scopedProgrammingState(body.programming);
+    let codeCwd: string | undefined;
+    if (programming && typeof body.cwd === 'string' && body.cwd.trim()) {
+      const resolvedCwd = resolve(body.cwd.trim());
+      if (!existsSync(resolvedCwd) || !statSync(resolvedCwd).isDirectory()) {
+        for (const a of upload.attachments) rmSync(a.path, { force: true });
+        return c.json({ error: `Not a folder: ${resolvedCwd}` }, 400);
+      }
+      codeCwd = resolvedCwd;
+    }
+    const mediaRaw = body.media as { kind?: unknown; aspect?: unknown } | undefined;
+    const media = mediaRaw?.kind === 'image' || mediaRaw?.kind === 'video' || mediaRaw?.kind === 'music'
+      ? { kind: mediaRaw.kind as 'image' | 'video' | 'music', ...(mediaRaw.aspect === 'square' || mediaRaw.aspect === 'landscape' || mediaRaw.aspect === 'portrait' ? { aspect: mediaRaw.aspect } : {}) }
+      : undefined;
+    webChannel.emitMessageInThread(text, session.id, session.id, undefined, undefined, undefined, upload.attachments, { ...(programming ? { programming, cwd: codeCwd } : {}), thisComputer: isThisComputer(c), ...(media ? { media } : {}) });
+    return c.json({
+      sent: true,
+      sessionId: session.id,
+      ...(upload.attachments.length > 0 ? { attachments: attachmentRefs(upload.attachments).map((a) => ({ name: a.name, kind: a.kind, mime: a.mime, url: `/api/chat/uploads/${a.ref}` })) } : {}),
+    });
+  } catch (err: any) {
+    // The message never reached the runtime: don't leave its files behind.
+    for (const a of upload.attachments) rmSync(a.path, { force: true });
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+// ─── Uploads (files the owner sent, served back to the owner) ──
+
+chat.get('/api/chat/uploads/:month/:file', (c) => {
+  const path = resolveUploadRef(c.req.param('month'), c.req.param('file'));
+  if (!path) return c.json({ error: 'Not found' }, 404);
+  const bytes = readFileSync(path);
+  const mime = uploadMime(bytes, c.req.param('file'));
+  if (!mime) return c.json({ error: 'Not found' }, 404);
+  const name = c.req.param('file').slice(37);
+  const fallbackName = name.replace(/[^\x20-\x7e]|["\\]/g, '_');
+  const encodedName = encodeURIComponent(name).replace(/['()*]/g, ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+  return new Response(bytes, {
+    headers: {
+      'Content-Type': mime,
+      'Content-Length': String(bytes.length),
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'private, max-age=31536000, immutable',
+      'Content-Disposition': `inline; filename="${fallbackName}"; filename*=UTF-8''${encodedName}`,
+    },
+  });
+});
+
+// ─── Settings ────────────────────────────────────────────────
+
+chat.get('/api/chat/settings', async (c) => {
+  if (!webChannel) return c.json({ error: 'Web channel not initialized' }, 503);
+  const stored = loadSettings();
+  return c.json({ ...webChannel.getSettings(), workspace: stored.workspace, permissionMode: loadPermissionMode() });
+});
+
+chat.put('/api/chat/settings', async (c) => {
+  if (!webChannel) return c.json({ error: 'Web channel not initialized' }, 503);
+  const body = await c.req.json<Partial<ChatWebSettings>>();
+  const current = webChannel.getSettings();
+  const stored = loadSettings();
+  // Widening what Mercury may do, from another device, is the owner's call.
+  if (body.bypassPermissions === true && !current.bypassPermissions) {
+    const wait = requireOwner(c, { id: 'permissions.allow-all', title: 'Turn on Allow All (Mercury acts without asking)' });
+    if (wait) return wait;
+  }
+  if (typeof body.workspace === 'string' && body.workspace !== stored.workspace) {
+    const wait = requireOwner(c, { id: `workspace.root:${body.workspace}`, title: 'Change the workspace folder', detail: body.workspace });
+    if (wait) return wait;
+  }
+  const next: ChatWebSettings = {
+    bypassPermissions: body.bypassPermissions ?? current.bypassPermissions,
+    restrictUser: body.restrictUser ?? current.restrictUser,
+    workspace: body.workspace ?? stored.workspace,
+  };
+  webChannel.setBypassPermissions(next.bypassPermissions);
+  webChannel.setRestrictUser(next.restrictUser);
+  saveSettings(next);
+  if (typeof body.bypassPermissions === 'boolean') savePermissionMode(body.bypassPermissions ? 'allow-all' : 'ask-me');
+  return c.json({ success: true, ...next, permissionMode: loadPermissionMode() });
+});
+
+// ─── Permission Resolution ───────────────────────────────────
+
+/** Stop button: interrupt this chat's work (`threadId`/`sessionId`), or everything when neither is given. */
+chat.post('/api/chat/stop', async (c) => {
+  if (!stopFn) return c.json({ error: 'Stop is not available on this runtime' }, 503);
+  try {
+    const body = await c.req.json<{ threadId?: unknown; sessionId?: unknown; keepQueued?: unknown }>().catch(() => ({} as { threadId?: unknown; sessionId?: unknown; keepQueued?: unknown }));
+    const threadId = typeof body.threadId === 'string' && body.threadId ? body.threadId.slice(0, 200) : undefined;
+    const sessionId = typeof body.sessionId === 'string' && body.sessionId ? body.sessionId.slice(0, 200) : undefined;
+    // keepQueued: stop only the running turn ("do mine first"); by default a
+    // stop also drops the chat's waiting messages (ADR-038).
+    const note = await stopFn(threadId || sessionId ? { channelId: threadId, sessionId, keepQueued: body.keepQueued === true } : undefined);
+    return c.json({ ok: true, note });
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
+  }
+});
+
+chat.post('/api/chat/permission/:id', async (c) => {
+  if (!webChannel) {
+    return c.json({ error: 'Web channel not initialized' }, 503);
+  }
+
+  const permId = c.req.param('id');
+  const body = await c.req.json<{ action?: string; targetId?: string }>().catch(() => ({} as { action?: string; targetId?: string }));
+  // One endpoint answers every prompt a screen shows: permission/continue/
+  // mode approvals AND choice pickers (/model, /permissions, ask_user). It
+  // used to resolve approvals only, so a picker answered in the attached
+  // terminal never reached the runtime: the command hung until the 2-minute
+  // timeout and the screen showed "Thinking" the whole time. An empty action
+  // is Esc: the picker is cancelled (its caller treats that as "no change").
+  if (!body.action) {
+    if (webChannel.cancelInteraction(permId, body.targetId)) return c.json({ resolved: true, cancelled: true });
+    return c.json({ error: 'Action required' }, 400);
+  }
+
+  // Prompts are bound to the chat session that raised them; without the
+  // targetId the session check in resolveInteraction always fails.
+  const resolved = webChannel.resolveApproval(permId, body.action, body.targetId)
+    || webChannel.resolveChoice(permId, body.action, body.targetId);
+  if (resolved) {
+    return c.json({ resolved: true });
+  }
+  return c.json({ resolved: false, error: 'Permission not found or expired' }, 404);
+});
+
+// ─── Models / Provider Switching ─────────────────────────────
+
+/**
+ * Failed model lookups are remembered briefly so that opening the picker
+ * while Ollama is down (or ChatGPT is signed out) doesn't wait on a timeout
+ * every time.
+ */
+const LOOKUP_RETRY_MS = 30_000;
+const failedLookups = new Map<string, number>();
+
+function recentlyFailed(key: string): boolean {
+  const at = failedLookups.get(key);
+  return at !== undefined && Date.now() - at < LOOKUP_RETRY_MS;
+}
+
+/** Every model the local Ollama server has pulled (empty if unreachable). */
+async function listOllamaModels(server: Pick<ProviderConfig, 'baseUrl' | 'username' | 'password'>): Promise<string[]> {
+  const root = server.baseUrl.replace(/\/+$/, '').replace(/\/(v1|api)$/, '');
+  const lookup = `ollama:${root}`;
+  if (recentlyFailed(lookup)) return [];
+  try {
+    const res = await fetch(`${root}/api/tags`, { headers: basicAuthHeaders(server), signal: AbortSignal.timeout(3000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = (await res.json()) as { models?: { name?: string }[] };
+    failedLookups.delete(lookup);
+    return (data.models ?? []).map((m) => m.name ?? '').filter(Boolean).sort();
+  } catch {
+    failedLookups.set(lookup, Date.now());
+    return [];
+  }
+}
+
+/** Models the signed-in ChatGPT plan offers; cached because the lookup is slow. */
+let chatgptModelCache: { at: number; models: string[] } | null = null;
+const CHATGPT_MODEL_TTL_MS = 10 * 60 * 1000;
+
+async function listChatGPTModels(): Promise<string[]> {
+  if (chatgptModelCache && Date.now() - chatgptModelCache.at < CHATGPT_MODEL_TTL_MS) {
+    return chatgptModelCache.models;
+  }
+  if (recentlyFailed('chatgpt')) return [];
+  try {
+    const { getValidChatGPTSession } = await import('../../auth/chatgpt-session.js');
+    const { fetchChatGPTModels } = await import('../../auth/chatgpt-models.js');
+    const session = await getValidChatGPTSession();
+    if (!session) throw new Error('not signed in');
+    const catalog = await fetchChatGPTModels(session.accessToken, session.accountId);
+    chatgptModelCache = { at: Date.now(), models: catalog.models };
+    failedLookups.delete('chatgpt');
+    return catalog.models;
+  } catch {
+    failedLookups.set('chatgpt', Date.now());
+    return [];
+  }
+}
+
+/**
+ * Mercury Cloud's chat models this account's tier may use (its /v1/models
+ * marks each `available`), with Cloud's own names. Cached for five minutes.
+ */
+let cloudModelCache: { at: number; models: Array<{ id: string; label?: string }> } | null = null;
+const CLOUD_MODEL_TTL_MS = 5 * 60 * 1000;
+const cloudLabels = new Map<string, string>();
+/** Why the last Mercury Cloud lookup failed, for the picker to say. */
+let cloudProblem: string | null = null;
+
+async function listMercuryCloudModels(): Promise<string[]> {
+  if (cloudModelCache && Date.now() - cloudModelCache.at < CLOUD_MODEL_TTL_MS) return cloudModelCache.models.map((m) => m.id);
+  if (recentlyFailed('mercuryCloud')) return cloudModelCache?.models.map((m) => m.id) ?? [];
+  try {
+    // The provider's own endpoint and auth (a fresh JWT or the access key).
+    const ep = await mediaService()?.endpointFor('mercuryCloud');
+    if (!ep) throw new Error('Mercury Cloud is not connected');
+    const res = await fetch(`${ep.baseUrl}/models`, { headers: ep.headers, signal: AbortSignal.timeout(5000) });
+    if (res.status === 401 || res.status === 403) throw new Error('Mercury Cloud sign-in expired: run `mercury cloud login` (or sign in again in Settings → Cloud) to see your models.');
+    if (!res.ok) throw new Error(`Mercury Cloud didn't answer (HTTP ${res.status}).`);
+    const data = (await res.json()) as { data?: Array<{ id?: string; label?: string; available?: boolean; output_modalities?: unknown }> };
+    const all = (data.data ?? []).filter((m): m is { id: string; label?: string; available?: boolean; output_modalities?: unknown } => typeof m.id === 'string' && m.id.length > 0);
+    // The tier decides: only models marked available (older deployments without the flag: all of them).
+    const tiered = all.some((m) => typeof m.available === 'boolean') ? all.filter((m) => m.available === true) : all;
+    const chat = tiered.filter((m) => isChatModelId(m.id) && (!Array.isArray(m.output_modalities) || m.output_modalities.includes('text')));
+    for (const m of chat) if (m.label) cloudLabels.set(m.id, m.label);
+    cloudModelCache = { at: Date.now(), models: chat.map((m) => ({ id: m.id, ...(m.label ? { label: m.label } : {}) })) };
+    failedLookups.delete('mercuryCloud');
+    cloudProblem = null;
+    return cloudModelCache.models.map((m) => m.id);
+  } catch (err) {
+    cloudProblem = err instanceof Error ? err.message : String(err);
+    failedLookups.set('mercuryCloud', Date.now());
+    return cloudModelCache?.models.map((m) => m.id) ?? [];
+  }
+}
+
+/** Providers that serve many models list each one; others list their configured model. */
+async function listProviderModels(p: ProviderConfig): Promise<string[]> {
+  if (p.name === 'ollamaLocal') return listOllamaModels(p);
+  if (p.name === 'chatgptWeb') return [...(await listChatGPTModels())];
+  if (p.name === 'mercuryCloud') return listMercuryCloudModels();
+  return [];
+}
+
+/** What the picker needs to show a model in plain language. */
+function describeModel(provider: string, model: string) {
+  const pref = getModelPref(provider, model);
+  // Mercury Cloud names its models itself ("Mercury Pro").
+  const auto = (provider === 'mercuryCloud' ? cloudLabels.get(model) : undefined) ?? humanizeModelName(model);
+  return {
+    label: pref.label ?? auto,
+    autoLabel: auto,
+    customLabel: pref.label ?? null,
+    group: modelGroupLabel(provider, model),
+    reasoning: effectiveReasoning(provider, model) ?? 'auto',
+    reasoningLevels: reasoningLevelsFor(provider, model),
+  };
+}
+
+/**
+ * The reply this chat is working on right now: its thinking and steps so
+ * far, the text written so far, and what it is doing. A screen that left
+ * the chat mid-turn shows this on return, then follows the live events.
+ */
+chat.get('/api/chat/threads/:id/live', (c) => {
+  const id = c.req.param('id');
+  const live = turnControls?.live?.(id);
+  if (!live) return c.json({ running: false });
+  return c.json({ running: true, startedAt: live.startedAt, activity: live.activity, trace: live.trace, text: webChannel?.liveTextFor(id) ?? '' });
+});
+
+chat.get('/api/chat/models', async (c) => {
+  const config = loadConfig();
+  const active = getActiveProviders(config);
+  const current = currentProviderFn ? currentProviderFn() : { name: config.providers.default || '', model: '' };
+  // An OpenAI-compatible server may say which models take an effort: ask
+  // about the current one before answering (bounded; cached for a day).
+  const currentPc = active.find((p) => p.name === current.name);
+  if (currentPc && current.model) await discoverReasoningCaps(currentPc, current.model).catch(() => undefined);
+  const entries: ({ name: string; model: string; available: boolean; isCurrent: boolean } & ReturnType<typeof describeModel>)[] = [];
+  const perProvider = await Promise.all(active.map((p) => listProviderModels(p)));
+  for (const [i, p] of active.entries()) {
+    const models = perProvider[i];
+    if (models.length && !models.includes(p.model)) models.unshift(p.model);
+    for (const model of models.length ? models : [p.model]) {
+      entries.push({
+        name: p.name,
+        model,
+        available: true,
+        isCurrent: p.name === current.name && model === current.model,
+        ...describeModel(p.name, model),
+      });
+    }
+  }
+  // The chat's own effort (#188), when the screen says which chat it shows.
+  const sessionId = c.req.query('sessionId');
+  const chatKey = sessionId && isValidModelRef(sessionId) ? sessionId : undefined;
+  const effort = effortFor(current.name, current.model, chatKey);
+  return c.json({
+    // Lookups that failed, said plainly (an expired Mercury Cloud sign-in).
+    notices: active.some((p) => p.name === 'mercuryCloud') && cloudProblem ? [cloudProblem] : [],
+    current: {
+      ...current,
+      ...describeModel(current.name, current.model),
+      effort: {
+        effective: effort.effective ?? 'auto',
+        source: effort.source,
+        modelDefault: effort.modelDefault,
+        chat: effort.chat ?? null,
+        ...(effort.chatUnsupported ? { chatUnsupported: true } : {}),
+      },
+    },
+    providers: entries,
+  });
+});
+
+/**
+ * One chat's effort override (#188): a level this model takes, "auto" (let
+ * the model decide, whatever the default), or null to use the model's
+ * default again.
+ */
+chat.post('/api/chat/effort', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => null);
+  if (!body || !isValidModelRef(body.sessionId)) return c.json({ error: 'sessionId is required' }, 400);
+  const level = body.level;
+  if (level !== null && level !== undefined && typeof level !== 'string') return c.json({ error: 'level must be a string or null' }, 400);
+  const config = loadConfig();
+  const current = currentProviderFn ? currentProviderFn() : { name: config.providers.default || '', model: '' };
+  if (typeof level === 'string' && level !== 'auto' && level !== 'default') {
+    if (!isReasoningLevel(level) || !reasoningLevelsFor(current.name, current.model).includes(level)) {
+      return c.json({ error: `${humanizeModelName(current.model)} doesn't take the effort '${level}'` }, 400);
+    }
+  }
+  setChatEffort(body.sessionId, level === null || level === undefined || level === 'default' ? null : (level as ReasoningLevel | 'auto'));
+  const effort = effortFor(current.name, current.model, body.sessionId);
+  return c.json({ ok: true, effort: { effective: effort.effective ?? 'auto', source: effort.source, modelDefault: effort.modelDefault, chat: effort.chat ?? null } });
+});
+
+/** Rename a model (label) and/or set its reasoning level. null / '' / 'auto' resets. */
+chat.post('/api/chat/models/prefs', async (c) => {
+  const body = await c.req.json<Record<string, unknown>>().catch(() => null);
+  // Same id rules as /api/chat/models/switch; anything else is a 400, not a 500.
+  if (!body || !isValidModelRef(body.provider) || !isValidModelRef(body.model)) {
+    return c.json({ error: 'provider and model must be non-empty strings of at most 256 characters' }, 400);
+  }
+  const { provider, model, label, reasoning } = body as { provider: string; model: string; label?: unknown; reasoning?: unknown };
+  if (label !== undefined && label !== null && typeof label !== 'string') {
+    return c.json({ error: 'label must be a string or null' }, 400);
+  }
+  if (reasoning !== undefined && reasoning !== null && typeof reasoning !== 'string') {
+    return c.json({ error: 'reasoning must be a string or null' }, 400);
+  }
+  // Only active providers: keeps model-prefs.json from growing unbounded.
+  if (!getActiveProviders(loadConfig()).some((p) => p.name === provider)) {
+    return c.json({ error: `Provider \`${provider}\` is not configured` }, 400);
+  }
+  if (typeof reasoning === 'string' && reasoning !== 'auto') {
+    if (!isReasoningLevel(reasoning) || !reasoningLevelsFor(provider, model).includes(reasoning)) {
+      return c.json({ error: `Reasoning level '${reasoning}' is not supported for ${model}` }, 400);
+    }
+  }
+  setModelPref(provider, model, {
+    label: label as string | null | undefined,
+    reasoning: reasoning as ReasoningLevel | 'auto' | null | undefined,
+  });
+  return c.json({ ok: true, ...describeModel(provider, model) });
+});
+
+chat.post('/api/chat/models/switch', async (c) => {
+  if (!modelSwitchFn) {
+    return c.json({ error: 'Model switching not available' }, 503);
+  }
+  const body = await c.req.json<{ provider?: unknown; model?: unknown }>().catch(() => null);
+  if (!body || typeof body.provider !== 'string' || !body.provider) {
+    return c.json({ error: 'provider is required' }, 400);
+  }
+  if (body.model !== undefined && typeof body.model !== 'string') {
+    return c.json({ error: 'model must be a string' }, 400);
+  }
+  const result = await modelSwitchFn(body.provider, body.model?.trim() || undefined);
+  return c.json(result);
+});
+
+// ─── Programming Mode ────────────────────────────────────────
+
+chat.get('/api/code/status', (c) => {
+  if (!programmingMode) {
+    return c.json({ available: false, state: 'off' });
+  }
+  return c.json({
+    available: true,
+    state: programmingMode.getState(),
+    active: programmingMode.isActive(),
+    statusText: programmingMode.getStatusText(),
+  });
+});
+
+chat.post('/api/code/toggle', (c) => {
+  if (!programmingMode) {
+    return c.json({ error: 'Programming mode not available' }, 400);
+  }
+  const newState = programmingMode.toggle();
+  return c.json({ state: newState, active: programmingMode.isActive() });
+});
+
+chat.post('/api/code/set', async (c) => {
+  if (!programmingMode) {
+    return c.json({ error: 'Programming mode not available' }, 400);
+  }
+  const body = await c.req.json<{ state: ProgrammingModeState }>();
+  if (body.state === 'off') programmingMode.setOff();
+  else if (body.state === 'auto') programmingMode.setAuto();
+  else if (body.state === 'plan') programmingMode.setPlan();
+  else if (body.state === 'execute') programmingMode.setExecute();
+  else return c.json({ error: 'Invalid state. Use: off, auto, plan, execute' }, 400);
+  return c.json({ state: programmingMode.getState(), active: programmingMode.isActive() });
+});
+
+// ─── Workspace / File Browser ────────────────────────────────
+
+const FILE_ICONS: Record<string, string> = {
+  '.ts': 'ts', '.tsx': 'tsx', '.js': 'js', '.jsx': 'jsx',
+  '.py': 'py', '.rs': 'rs', '.go': 'go', '.java': 'java',
+  '.json': 'json', '.yaml': 'yaml', '.yml': 'yaml', '.toml': 'toml',
+  '.md': 'md', '.txt': 'txt', '.css': 'css', '.html': 'html',
+  '.sh': 'sh', '.bash': 'sh', '.zsh': 'sh',
+};
+
+const IGNORED_DIRS = new Set([
+  'node_modules', '.git', '.next', 'dist', 'build', '.cache',
+  '__pycache__', '.tox', '.mypy_cache', 'target', '.DS_Store',
+  '.turbo', 'coverage', '.nyc_output',
+]);
+
+const MAX_FILE_SIZE = 512 * 1024; // 512KB limit for preview
+
+chat.get('/api/workspace/tree', (c) => {
+  const settings = loadSettings();
+  const rootDir = settings.workspace || process.cwd();
+  if (!existsSync(rootDir)) {
+    return c.json({ error: 'Workspace directory not found', path: rootDir }, 404);
+  }
+
+  const subPath = c.req.query('path') || '';
+  const targetDir = subPath ? resolve(rootDir, subPath) : rootDir;
+
+  // Security: ensure target is within workspace
+  if (!isInsideWorkspace(targetDir, rootDir)) {
+    return c.json({ error: 'Path outside workspace' }, 403);
+  }
+
+  if (!existsSync(targetDir)) {
+    return c.json({ error: 'Directory not found' }, 404);
+  }
+
+  try {
+    const entries = readdirSync(targetDir, { withFileTypes: true });
+    const items = entries
+      .filter(e => !IGNORED_DIRS.has(e.name) && !e.name.startsWith('.'))
+      .map(e => {
+        const fullPath = join(targetDir, e.name);
+        const relPath = relative(rootDir, fullPath);
+        const isDir = e.isDirectory();
+        const ext = isDir ? '' : extname(e.name);
+        let size = 0;
+        try { if (!isDir) size = statSync(fullPath).size; } catch {}
+        return {
+          name: e.name,
+          path: relPath,
+          isDirectory: isDir,
+          type: isDir ? 'directory' : (FILE_ICONS[ext] || 'file'),
+          size,
+          ext,
+        };
+      })
+      .sort((a, b) => {
+        if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+
+    return c.json({
+      root: rootDir,
+      currentPath: subPath || '.',
+      items,
+    });
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+chat.get('/api/workspace/file', (c) => {
+  const settings = loadSettings();
+  const rootDir = settings.workspace || process.cwd();
+  const filePath = c.req.query('path');
+  if (!filePath) {
+    return c.json({ error: 'path query parameter required' }, 400);
+  }
+
+  const fullPath = resolve(rootDir, filePath);
+
+  // Security: ensure within workspace
+  if (!isInsideWorkspace(fullPath, rootDir)) {
+    return c.json({ error: 'Path outside workspace' }, 403);
+  }
+  const off = protectedReason(fullPath, !isThisComputer(c));
+  if (off) return c.json({ error: off }, 403);
+
+  if (!existsSync(fullPath)) {
+    return c.json({ error: 'File not found' }, 404);
+  }
+
+  try {
+    const stat = statSync(fullPath);
+    if (stat.isDirectory()) {
+      return c.json({ error: 'Path is a directory' }, 400);
+    }
+    if (stat.size > MAX_FILE_SIZE) {
+      return c.json({
+        path: filePath,
+        name: basename(fullPath),
+        size: stat.size,
+        truncated: true,
+        content: readFileSync(fullPath, 'utf8').slice(0, MAX_FILE_SIZE),
+        ext: extname(fullPath),
+      });
+    }
+    return c.json({
+      path: filePath,
+      name: basename(fullPath),
+      size: stat.size,
+      truncated: false,
+      content: readFileSync(fullPath, 'utf8'),
+      ext: extname(fullPath),
+    });
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+chat.put('/api/workspace/root', async (c) => {
+  const body = await c.req.json<{ path: string }>();
+  if (!body.path) {
+    return c.json({ error: 'path is required' }, 400);
+  }
+  const resolvedPath = resolve(body.path);
+  if (!existsSync(resolvedPath)) {
+    return c.json({ error: 'Directory does not exist' }, 404);
+  }
+  // The workspace bounds what the file endpoints reach: from another device, the owner decides where it is.
+  const wait = requireOwner(c, { id: `workspace.root:${resolvedPath}`, title: 'Change the workspace folder', detail: resolvedPath });
+  if (wait) return wait;
+  const stat = statSync(resolvedPath);
+  if (!stat.isDirectory()) {
+    return c.json({ error: 'Path is not a directory' }, 400);
+  }
+
+  const settings = loadSettings();
+  settings.workspace = resolvedPath;
+  saveSettings(settings);
+  return c.json({ success: true, workspace: resolvedPath });
+});
+
+// ─── Chat History ─────────────────────────────────────────────
+
+chat.get('/api/chat/threads', (c) => {
+  if (!sessions) return c.json({ error: 'Session repository not initialized' }, 503);
+  return c.json({ threads: sessions.list().map((session) => toThread(session, false)) });
+});
+
+chat.post('/api/chat/threads', async (c) => {
+  if (!sessions) return c.json({ error: 'Session repository not initialized' }, 503);
+  const body: { title?: string } = await c.req.json<{ title?: string }>().catch(() => ({}));
+  return c.json(toThread(sessions.create({ title: body.title }), true), 201);
+});
+
+chat.get('/api/chat/threads/:id', (c) => {
+  const id = c.req.param('id');
+  if (!sessions) return c.json({ error: 'Session repository not initialized' }, 503);
+  try {
+    return c.json(toThread(sessions.get(id), true));
+  } catch {
+    return c.json({ error: 'Thread not found' }, 404);
+  }
+});
+
+/** Owner titles survive automatic naming and keep the conversation's position. */
+chat.put('/api/chat/threads/:id/title', async (c) => {
+  if (!sessions) return c.json({ error: 'Session repository not initialized' }, 503);
+  const body: unknown = await c.req.json().catch(() => null);
+  if (!body || typeof body !== 'object' || !('title' in body) || typeof body.title !== 'string') {
+    return c.json({ error: 'Send { title: "New chat name" }.' }, 400);
+  }
+  const id = c.req.param('id');
+  try { sessions.get(id); } catch { return c.json({ error: 'Thread not found' }, 404); }
+  try {
+    const session = sessions.updateTitle(id, body.title, 'user', { touch: false });
+    return c.json({ id: session.id, title: session.title });
+  } catch (error) {
+    if (error instanceof SessionTitleError) return c.json({ error: error.message }, 400);
+    return c.json({ error: 'Could not save the chat name. Please try again.' }, 500);
+  }
+});
+
+chat.delete('/api/chat/threads/:id', (c) => {
+  const id = c.req.param('id');
+  if (!sessions) return c.json({ error: 'Session repository not initialized' }, 503);
+  try {
+    sessions.archive(id);
+    return c.json({ deleted: true });
+  } catch {
+    return c.json({ deleted: false }, 404);
+  }
+});
+
+chat.post('/api/chat/threads/:id/delete', async (c) => {
+  const id = c.req.param('id');
+  if (!sessions) return c.json({ error: 'Session repository not initialized' }, 503);
+  const body: { confirmSessionId?: string } = await c.req.json<{ confirmSessionId?: string }>().catch(() => ({}));
+  if (body.confirmSessionId !== id) return c.json({ error: 'Explicit session deletion confirmation is required' }, 400);
+  try {
+    const target = sessions.get(id);
+    if (target.id !== id) return c.json({ error: 'Confirmation must use the exact session ID' }, 400);
+    const syncPending = sessionSyncEnabledFn?.() === true;
+    const deleted = syncPending ? sessions.markDeleted(target.id) : sessions.deletePermanently(target.id);
+    // Its artifacts go with it (Mercury's copies; the owner's original files stay).
+    let artifactsRemoved = 0;
+    try { artifactsRemoved = artifactStore().removeThread(target.id); } catch { /* the hourly sweep catches it */ }
+    return c.json({ deleted: true, sessionId: deleted.id, syncPending, artifactsRemoved });
+  } catch {
+    return c.json({ deleted: false, error: 'Thread not found' }, 404);
+  }
+});
+
+/** Save a thread to come back to later, or unsave it: { saved: boolean }. */
+// Which chats are working right now, which wait, and how many may run at once (ADR-037).
+chat.get('/api/chat/running', (c) => {
+  if (!turnControls) return c.json({ error: 'Not available on this runtime' }, 503);
+  return c.json(turnsSnapshot(turnControls));
+});
+
+// How many chats may run at once: { maxTurns: 0 (automatic) … 16 }. Applies at once.
+chat.put('/api/chat/concurrency', async (c) => {
+  if (!turnControls) return c.json({ error: 'Not available on this runtime' }, 503);
+  const body = await c.req.json<{ maxTurns?: unknown }>().catch(() => ({} as { maxTurns?: unknown }));
+  const n = body.maxTurns;
+  if (typeof n !== 'number' || !Number.isInteger(n) || n < 0 || n > 16) {
+    return c.json({ error: 'maxTurns must be a whole number from 0 (automatic) to 16.' }, 400);
+  }
+  turnControls.setLimit(n);
+  return c.json(turnsSnapshot(turnControls));
+});
+
+// Where this chat's message stands: running, waiting in line (and behind what), or nothing.
+chat.get('/api/chat/threads/:id/queue', (c) => {
+  if (!queueControls) return c.json({ state: 'none' });
+  return c.json(queueControls.state(c.req.param('id')));
+});
+
+// "Do mine first": this chat's waiting messages go to the front of the line.
+chat.post('/api/chat/threads/:id/queue/first', (c) => {
+  if (!queueControls) return c.json({ error: 'Not available on this runtime' }, 503);
+  return c.json({ moved: queueControls.prioritize(c.req.param('id')) });
+});
+
+// This chat's research: switched on for the next message, running (phase, sources…), or its last run.
+chat.get('/api/chat/threads/:id/research', (c) => {
+  if (!researchControls) return c.json({ armed: false, run: null });
+  return c.json(researchControls.state(c.req.param('id')));
+});
+
+// "Write the report now": stop searching and write the report from what was read.
+chat.post('/api/chat/threads/:id/research/finish', (c) => {
+  if (!researchControls) return c.json({ error: 'Not available on this runtime' }, 503);
+  const r = researchControls.finish(c.req.param('id'));
+  return r.ok ? c.json({ ok: true }) : c.json({ ok: false, error: r.reason }, 409);
+});
+
+// Research off for this chat's next message (a run already going is stopped with Stop).
+chat.post('/api/chat/threads/:id/research/off', (c) => {
+  if (!researchControls) return c.json({ error: 'Not available on this runtime' }, 503);
+  researchControls.off(c.req.param('id'));
+  return c.json({ ok: true });
+});
+
+// A site's icon for the source lists (fetched and cached by the runtime; the apps load nothing from third parties).
+chat.get('/api/chat/favicon', async (c) => {
+  const icon = await favicons().get(c.req.query('domain') ?? '');
+  if (!icon) return c.body(null, 204, { 'Cache-Control': 'private, max-age=86400' });
+  return new Response(new Uint8Array(icon.bytes), { status: 200, headers: {
+    'Content-Type': icon.mime,
+    'Cache-Control': 'private, max-age=604800',
+    // An SVG opened on its own can't run anything.
+    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'",
+    'X-Content-Type-Options': 'nosniff',
+  } });
+});
+
+// The owner's answer to a research plan: { action: 'start' | 'cancel', questions?: string[] }.
+chat.post('/api/chat/research/plan/:id', async (c) => {
+  if (!webChannel) return c.json({ error: 'Web channel not initialized' }, 503);
+  const body: { action?: unknown; questions?: unknown } = await c.req.json<{ action?: unknown; questions?: unknown }>().catch(() => ({}));
+  if (body.action !== 'start' && body.action !== 'cancel') return c.json({ error: 'Send { action: "start" } or { action: "cancel" }.' }, 400);
+  const questions = Array.isArray(body.questions) ? body.questions.filter((q): q is string => typeof q === 'string').slice(0, 8) : undefined;
+  const ok = webChannel.answerResearchPlan(c.req.param('id'), body.action, questions);
+  return ok ? c.json({ ok: true }) : c.json({ ok: false, error: 'That plan was already answered or has expired.' }, 410);
+});
+
+chat.post('/api/chat/threads/:id/save', async (c) => {
+  const id = c.req.param('id');
+  if (!sessions) return c.json({ error: 'Session repository not initialized' }, 503);
+  const body: { saved?: unknown } = await c.req.json<{ saved?: unknown }>().catch(() => ({}));
+  if (typeof body.saved !== 'boolean') return c.json({ error: 'Send { saved: true } or { saved: false }.' }, 400);
+  try {
+    const session = sessions.setSaved(id, body.saved);
+    return c.json({ id: session.id, saved: !!session.savedAt, savedAt: session.savedAt ? new Date(session.savedAt).toISOString() : null });
+  } catch {
+    return c.json({ error: 'Thread not found' }, 404);
+  }
+});
+
+/**
+ * Undo: take back your last message and Mercury's reply to it, so you can
+ * change it. Only the last message you sent, and only once its turn has
+ * ended (stop it first). Returns what you wrote, to put back in the box.
+ */
+chat.post('/api/chat/threads/:id/undo', async (c) => {
+  const id = c.req.param('id');
+  if (!sessions) return c.json({ error: 'Session repository not initialized' }, 503);
+  // Which message the client means: its id, or (for a message the client
+  // showed before the runtime saved it) its text. Either must be the last one.
+  const body: { messageId?: string; content?: string } = await c.req.json<{ messageId?: string; content?: string }>().catch(() => ({}));
+  let session;
+  try { session = sessions.get(id); } catch { return c.json({ error: 'Thread not found' }, 404); }
+  if (busyFn?.(session.id)) return c.json({ error: 'Mercury is still working on this. Stop it first.', busy: true }, 409);
+  const last = [...session.messages].reverse().find((m) => m.role === 'user' && (m.kind ?? 'message') === 'message');
+  if (!last) return c.json({ error: 'There is nothing to undo.' }, 409);
+  const notLast = (body.messageId && body.messageId.toLowerCase() !== last.id)
+    || (typeof body.content === 'string' && body.content.trim() !== last.content.trim());
+  if (notLast) return c.json({ error: 'Only your last message can be undone.', notLast: true }, 409);
+  const removed = sessions.removeFrom(session.id, last.id);
+  const attachments = (last.metadata as { attachments?: unknown } | undefined)?.attachments;
+  return c.json({ ok: true, content: last.content, attachments: Array.isArray(attachments) ? attachments : [], removed: removed.length });
+});
+
+chat.post('/api/chat/threads/:id/messages', async (c) => {
+  return c.json({ error: 'Messages are written by /api/chat/send and the agent runtime' }, 410);
+});
+
+export default chat;

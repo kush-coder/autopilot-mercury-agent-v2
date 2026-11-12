@@ -1,0 +1,560 @@
+import type { Tool } from 'ai';
+import { ensurePinnedBinaries } from './shell/argv-lane.js';
+import { PermissionManager } from './permissions.js';
+import { createReadFileTool } from './filesystem/read-file.js';
+import { createWriteFileTool } from './filesystem/write-file.js';
+import { createCreateFileTool } from './filesystem/create-file.js';
+import { createListDirTool } from './filesystem/list-dir.js';
+import { createDeleteFileTool } from './filesystem/delete-file.js';
+import { createEditFileTool } from './filesystem/edit-file.js';
+import { createSendFileTool } from './filesystem/send-file.js';
+import { createGenerateImageTool, type GenerateImageDeps } from './media/generate-image.js';
+import { createGenerateSpeechTool, type GenerateSpeechDeps } from './media/generate-speech.js';
+import { createGenerateMusicTool, createGenerateVideoTool, type MediaJobDeps } from './media/generate-video.js';
+import { createSendMessageTool } from './messaging/send-message.js';
+import { createApproveScopeTool } from './filesystem/approve-scope.js';
+import { createRunCommandTool } from './shell/run-command.js';
+import { createCdTool } from './shell/cd.js';
+import { createApproveCommandTool } from './shell/approve-command.js';
+import { createInstallSkillTool } from './skills/install-skill.js';
+import { createCreateSkillTool } from './skills/create-skill.js';
+import { createListSkillsTool } from './skills/list-skills.js';
+import { createUseSkillTool } from './skills/use-skill.js';
+import { createScheduleTaskTool } from './scheduler/schedule-task.js';
+import { guardTools } from '../security/tool-guard.js';
+import { createListTasksTool } from './scheduler/list-tasks.js';
+import { createCancelTaskTool } from './scheduler/cancel-task.js';
+import { createBudgetStatusTool } from './system/budget-status.js';
+import { createSaveMemoryTool } from './system/save-memory.js';
+import { createSearchMemoryTool } from './system/search-memory.js';
+import { createSessionHistoryTools } from './system/session-history.js';
+import type { SessionRepository } from '../sessions/repository.js';
+import { ScopedValue } from '../utils/turn-scope.js';
+import { createForgetMemoryTool } from './system/forget-memory.js';
+import { createConfirmBeliefTool } from './system/confirm-belief.js';
+import { createCorrectBeliefTool } from './system/correct-belief.js';
+import { createGitStatusTool } from './git/git-status.js';
+import { createGitDiffTool } from './git/git-diff.js';
+import { createGitLogTool } from './git/git-log.js';
+import { createGitAddTool } from './git/git-add.js';
+import { createGitCommitTool } from './git/git-commit.js';
+import { createGitPushTool } from './git/git-push.js';
+import { createCreatePrTool } from './github/create-pr.js';
+import { createReviewPrTool } from './github/review-pr.js';
+import { createListIssuesTool } from './github/list-issues.js';
+import { createCreateIssueTool } from './github/create-issue.js';
+import { createGithubApiTool } from './github/github-api.js';
+import { createFetchUrlTool } from './web/fetch-url.js';
+import { createWebSearchTool } from './web/web-search.js';
+import { activeCallScheduler, describeTime } from '../plugins/call-schedule.js';
+import { tool, zodSchema } from 'ai';
+import { z } from 'zod';
+import {
+  createSpotifySearchTool,
+  createSpotifyPlayTool,
+  createSpotifyPauseTool,
+  createSpotifyNextTool,
+  createSpotifyPreviousTool,
+  createSpotifyNowPlayingTool,
+  createSpotifyDevicesTool,
+  createSpotifyQueueTool,
+  createSpotifyLikeTool,
+  createSpotifyVolumeTool,
+  createSpotifyShuffleTool,
+  createSpotifyRepeatTool,
+  createSpotifyTopTracksTool,
+  createSpotifyPlaylistsTool,
+} from './spotify/index.js';
+import { createAskUserTool, createUpdatePlanTool, setAskUserHandler } from './interaction/index.js';
+import { isGitHubConfigured, setGitHubToken } from '../utils/github.js';
+import type { SkillLoader } from '../skills/loader.js';
+import type { Scheduler } from '../core/scheduler.js';
+import type { TokenBudget } from '../utils/tokens.js';
+import type { SubAgentSupervisor } from '../core/supervisor.js';
+import type { SpotifyClient } from '../spotify/client.js';
+import { createDelegateTaskTool, createListAgentsTool, createStopAgentTool } from './subagents/index.js';
+import { getPluginTools } from '../plugins/tool-bridge.js';
+import { createDispatchBotTool } from '../bots/tools/dispatch-bot.js';
+import type { UserMemoryStore } from '../memory/user-memory.js';
+import type { CwdSource } from './filesystem/resolve-path.js';
+import { logger } from '../utils/logger.js';
+import type { McpManager } from './mcp/manager.js';
+import type { McpServerStatus } from './mcp/types.js';
+import { IsolatedBrowserReader } from './browser/reader.js';
+import { createBrowserTools } from './browser/tools.js';
+
+export interface ChatCommandContext {
+  toolNames: () => string[];
+  skillNames: () => string[];
+  config: () => import('../utils/config.js').MercuryConfig;
+  tokenBudget: () => import('../utils/tokens.js').TokenBudget;
+  manual: () => string;
+  memorySummary: () => import('../memory/user-memory.js').UserMemorySummary;
+  memoryRecent: (limit?: number) => import('../memory/user-memory.js').UserMemoryRecord[];
+  memorySearch: (query: string, limit?: number) => import('../memory/user-memory.js').UserMemoryRecord[];
+  memorySetLearningPaused: (paused: boolean) => void;
+  memoryClear: () => number;
+  memoryGetSubconscious: (limit?: number) => import('../memory/user-memory.js').UserMemoryRecord[];
+  memoryIsShareLearning: () => boolean;
+  memorySetShareLearning: (enabled: boolean) => void;
+  mcpStatus?: () => McpServerStatus[];
+}
+
+export class CapabilityRegistry {
+  readonly permissions: PermissionManager;
+  private tools: Record<string, Tool> = {};
+  private skillLoader?: SkillLoader;
+  private scheduler?: Scheduler;
+  private tokenBudget?: TokenBudget;
+  private supervisor?: SubAgentSupervisor;
+  private spotifyClient?: SpotifyClient;
+  private userMemory?: UserMemoryStore;
+  private sendFileHandler?: (filePath: string, channel?: string) => Promise<void>;
+  private imageGeneration?: Omit<GenerateImageDeps, 'permissions' | 'getCwd'>;
+  private speechGeneration?: GenerateSpeechDeps;
+  private mediaJobDeps?: Omit<MediaJobDeps, 'permissions' | 'getCwd'>;
+  private sendMessageHandler?: (content: string) => Promise<void>;
+  private chatCommandContext?: ChatCommandContext;
+  /** Per turn while a turn claims it (ADR-037); the registry-wide cwd otherwise. */
+  private readonly currentCwd = new ScopedValue(process.cwd());
+  private researchModeGetter: (() => boolean) | null = null;
+  private mcp?: McpManager;
+  private browser?: IsolatedBrowserReader;
+
+  /**
+   * Mercury Bots dispatch handler — set once the BotManager exists
+   * (src/index.ts). Registers the dispatch_bot tool so the main agent can
+   * hand tasks to the bot fleet (the bots section in the system prompt comes
+   * from BotManager.getSystemPromptSection via the Agent).
+   */
+  setBotDispatchHandler(handler: (botId: string, message: string, ctx: { channelType: string; channelId: string }) => import('../bots/tools/dispatch-bot.js').BotDispatchResult | null, channelCtx: () => { channelType: string; channelId: string }): void {
+    this.tools.dispatch_bot = createDispatchBotTool(handler, channelCtx);
+    logger.info('Bot dispatch tool registered (dispatch_bot)');
+  }
+
+  constructor(skillLoader?: SkillLoader, scheduler?: Scheduler, tokenBudget?: TokenBudget, supervisor?: SubAgentSupervisor, userMemory?: UserMemoryStore) {
+    this.permissions = new PermissionManager();
+    // Resolve argv-lane binaries once, at startup, from the pinned PATH (#103).
+    ensurePinnedBinaries();
+    this.skillLoader = skillLoader;
+    this.scheduler = scheduler;
+    this.tokenBudget = tokenBudget;
+    this.supervisor = supervisor;
+    this.userMemory = userMemory;
+  }
+
+  setResearchModeGetter(getter: () => boolean): void {
+    this.researchModeGetter = getter;
+  }
+
+  setSessionRepository(sessions: SessionRepository): void {
+    Object.assign(this.tools, createSessionHistoryTools(sessions, (name) => this.canReadSessions(name)));
+  }
+
+  private canReadSessions(name: string): boolean {
+    const context = this.permissions.currentContext();
+    // Some remote adapters do not authenticate a top-level senderRole. An
+    // absent role there must not grant access to the owner's other chats.
+    return !this.toolsDisabled && context.senderRole !== 'member'
+      && (context.senderRole === 'admin' || ['cli', 'web', 'desktop', 'internal'].includes(context.channelType))
+      && (context.allowedTools === undefined || context.allowedTools.includes(name));
+  }
+
+  private filterSessionTools(tools: Record<string, Tool>): Record<string, Tool> {
+    const filtered = { ...tools };
+    for (const name of ['search_sessions', 'read_session']) {
+      if (!this.canReadSessions(name)) delete filtered[name];
+    }
+    return filtered;
+  }
+
+  isResearchMode(): boolean {
+    return this.researchModeGetter ? this.researchModeGetter() : false;
+  }
+
+  setChatCommandContext(ctx: ChatCommandContext): void {
+    this.chatCommandContext = ctx;
+  }
+
+  getChatCommandContext(): ChatCommandContext | undefined {
+    return this.chatCommandContext;
+  }
+
+  /**
+   * Channel of the calling agent. Stored in its permission context, so a
+   * sub-agent (running under its own context) never overwrites the main
+   * agent's channel, and its prompts route to its own source channel.
+   */
+  setChannelContext(channelId: string, channelType: string, sessionId?: string): void {
+    this.permissions.setCurrentContext(channelType, channelId, sessionId);
+  }
+
+  getChannelContext(): { channelId: string; channelType: string } {
+    const ctx = this.permissions.currentContext();
+    return { channelId: ctx.channelId, channelType: ctx.channelType };
+  }
+
+  private readonly toolsDisabledValue = new ScopedValue(false);
+  private get toolsDisabled(): boolean {
+    return this.toolsDisabledValue.get();
+  }
+
+  /**
+   * No tools at all for the current turn (a chat channel at "general"
+   * access). Enforced here so every code path that asks for tools, including
+   * the plan and narration-guard paths, gets none.
+   */
+  setToolsDisabled(disabled: boolean): void {
+    this.toolsDisabledValue.set(disabled);
+  }
+
+  areToolsDisabled(): boolean {
+    return this.toolsDisabled;
+  }
+
+  getCwd(): string {
+    return this.currentCwd.get();
+  }
+
+  /**
+   * Give the calling turn its own working directory and tools switch
+   * (ADR-037), starting from `cwd` (default: the registry-wide one). From
+   * then on `cd`, `setCwd` and `setToolsDisabled` in that turn — and in
+   * anything it awaits or spawns — change only that turn. No-op outside a
+   * turn scope.
+   */
+  claimTurnState(cwd?: string): void {
+    this.currentCwd.claim(cwd ?? this.currentCwd.getGlobal());
+    this.toolsDisabledValue.claim(false);
+  }
+
+  /** The registry-wide working directory (the terminal's), whatever turn is calling. */
+  getGlobalCwd(): string {
+    return this.currentCwd.getGlobal();
+  }
+
+  setGlobalCwd(dir: string): void {
+    this.currentCwd.setGlobal(dir);
+  }
+
+  /** Returns false (and keeps the current directory) when the cwd guard refuses. */
+  setCwd(dir: string): boolean {
+    if (this.cwdGuard && !this.cwdGuard(dir)) return false;
+    this.currentCwd.set(dir);
+    return true;
+  }
+
+  private cwdGuard: ((dir: string) => boolean) | null = null;
+  private pathRoots: Array<readonly [string, string]> = [];
+  /** What file and git tools resolve relative paths against (cwd + named roots). */
+  private readonly cwdSource: CwdSource = Object.assign(() => this.getCwd(), { roots: () => this.pathRoots });
+
+  /** Limit where `cd` (tool or shell) may move this registry's cwd. */
+  setCwdGuard(guard: ((dir: string) => boolean) | null): void {
+    this.cwdGuard = guard;
+  }
+
+  /**
+   * Relative paths starting with one of these prefixes resolve under the
+   * given directory, regardless of cwd (e.g. a bot's "_shared/…").
+   */
+  setPathRoots(roots: Array<readonly [prefix: string, dir: string]>): void {
+    this.pathRoots = roots;
+  }
+
+  setSendFileHandler(handler: (filePath: string, channel?: string) => Promise<void>): void {
+    this.sendFileHandler = handler;
+  }
+
+  /** Video and music as background jobs (ADR-042 phase 3): registers generate_video, generate_music. */
+  setMediaJobs(deps: Omit<MediaJobDeps, 'permissions' | 'getCwd'>): void {
+    this.mediaJobDeps = deps;
+  }
+
+  /** Tells the owner something in the current chat, from Mercury itself (not the model): ADR-044. */
+  private ownerNotice?: (text: string) => void;
+
+  setOwnerNotice(fn: (text: string) => void): void {
+    this.ownerNotice = fn;
+  }
+
+  /** Text to speech as a deliverable (ADR-042 phase 2): registers generate_speech. */
+  setSpeechGeneration(deps: GenerateSpeechDeps): void {
+    this.speechGeneration = deps;
+  }
+
+  /** Real image generation (ADR-042): registers generate_image. */
+  setImageGeneration(deps: Omit<GenerateImageDeps, 'permissions' | 'getCwd'>): void {
+    this.imageGeneration = deps;
+  }
+
+  setSendMessageHandler(handler: (content: string) => Promise<void>): void {
+    this.sendMessageHandler = handler;
+  }
+
+  setSupervisor(supervisor: SubAgentSupervisor): void {
+    this.supervisor = supervisor;
+  }
+
+  setSpotifyClient(client: SpotifyClient): void {
+    this.spotifyClient = client;
+  }
+
+  registerSpotifyTools(): void {
+    if (!this.spotifyClient) return;
+    this.tools.spotify_search = createSpotifySearchTool(this.spotifyClient);
+    this.tools.spotify_play = createSpotifyPlayTool(this.spotifyClient);
+    this.tools.spotify_pause = createSpotifyPauseTool(this.spotifyClient);
+    this.tools.spotify_next = createSpotifyNextTool(this.spotifyClient);
+    this.tools.spotify_previous = createSpotifyPreviousTool(this.spotifyClient);
+    this.tools.spotify_now_playing = createSpotifyNowPlayingTool(this.spotifyClient);
+    this.tools.spotify_devices = createSpotifyDevicesTool(this.spotifyClient);
+    this.tools.spotify_queue = createSpotifyQueueTool(this.spotifyClient);
+    this.tools.spotify_like = createSpotifyLikeTool(this.spotifyClient);
+    this.tools.spotify_volume = createSpotifyVolumeTool(this.spotifyClient);
+    this.tools.spotify_shuffle = createSpotifyShuffleTool(this.spotifyClient);
+    this.tools.spotify_repeat = createSpotifyRepeatTool(this.spotifyClient);
+    this.tools.spotify_top_tracks = createSpotifyTopTracksTool(this.spotifyClient);
+    this.tools.spotify_playlists = createSpotifyPlaylistsTool(this.spotifyClient);
+    logger.info('Spotify tools registered');
+  }
+
+  registerAll(): void {
+    const manifest = this.permissions.getManifest();
+
+    if (manifest.capabilities.browser?.enabled && !this.permissions.isFailClosed()) {
+      this.browser ??= new IsolatedBrowserReader({ executable: manifest.capabilities.browser.executable });
+    }
+
+    if (manifest.capabilities.filesystem.enabled) {
+      this.tools.read_file = createReadFileTool(this.permissions, this.cwdSource);
+      this.tools.write_file = createWriteFileTool(this.permissions, this.cwdSource);
+      this.tools.create_file = createCreateFileTool(this.permissions, this.cwdSource);
+      this.tools.list_dir = createListDirTool(this.permissions, this.cwdSource);
+      this.tools.delete_file = createDeleteFileTool(this.permissions, this.cwdSource);
+      this.tools.edit_file = createEditFileTool(this.permissions, this.cwdSource);
+
+      if (this.sendFileHandler) {
+        this.tools.send_file = createSendFileTool(this.permissions, this.cwdSource, this.sendFileHandler);
+      }
+
+      this.tools.approve_scope = createApproveScopeTool(this.permissions, this.cwdSource);
+
+      if (this.imageGeneration) {
+        this.tools.generate_image = createGenerateImageTool({ ...this.imageGeneration, permissions: this.permissions, getCwd: this.cwdSource });
+      }
+      if (this.speechGeneration) {
+        this.tools.generate_speech = createGenerateSpeechTool(this.speechGeneration);
+      }
+      if (this.mediaJobDeps) {
+        const deps = { ...this.mediaJobDeps, permissions: this.permissions, getCwd: this.cwdSource };
+        this.tools.generate_video = createGenerateVideoTool(deps);
+        this.tools.generate_music = createGenerateMusicTool(deps);
+      }
+
+      logger.info('Filesystem tools registered');
+    }
+
+    if (this.sendMessageHandler) {
+      this.tools.send_message = createSendMessageTool(this.sendMessageHandler);
+      logger.info('Messaging tool registered');
+    }
+
+    if (manifest.capabilities.shell.enabled) {
+      this.tools.run_command = createRunCommandTool(this.permissions, () => this.getCwd(), (dir: string) => this.setCwd(dir));
+      this.tools.cd = createCdTool(() => this.getCwd(), (dir: string) => this.setCwd(dir));
+      this.tools.approve_command = createApproveCommandTool(this.permissions);
+      logger.info('Shell tools registered');
+    }
+
+    if (this.skillLoader) {
+      this.tools.install_skill = createInstallSkillTool(this.skillLoader);
+      this.tools.create_skill = createCreateSkillTool(this.skillLoader);
+      this.tools.list_skills = createListSkillsTool(this.skillLoader);
+      this.tools.use_skill = createUseSkillTool(this.skillLoader, this.permissions);
+      logger.info('Skill tools registered');
+    }
+
+    if (this.scheduler) {
+      this.tools.schedule_task = createScheduleTaskTool(this.scheduler, this.permissions, () => this.getChannelContext(), (text) => this.ownerNotice?.(text));
+      this.tools.list_scheduled_tasks = createListTasksTool(this.scheduler);
+      this.tools.cancel_scheduled_task = createCancelTaskTool(this.scheduler);
+      logger.info('Scheduler tools registered');
+    }
+
+    if (this.tokenBudget) {
+      this.tools.budget_status = createBudgetStatusTool(this.tokenBudget);
+      logger.info('Budget tool registered');
+    }
+
+    if (this.userMemory) {
+      this.tools.save_memory = createSaveMemoryTool(this.userMemory);
+      this.tools.search_memory = createSearchMemoryTool(this.userMemory);
+      // Owner Model (ADR-026): the owner's verbs over what Mercury believes about them.
+      this.tools.forget_memory = createForgetMemoryTool(this.userMemory);
+      this.tools.confirm_belief = createConfirmBeliefTool(this.userMemory);
+      this.tools.correct_belief = createCorrectBeliefTool(this.userMemory);
+      logger.info('Second Brain tools registered (save_memory, search_memory, forget_memory, confirm_belief, correct_belief)');
+    }
+
+    if (manifest.capabilities.git?.enabled) {
+      this.tools.git_status = createGitStatusTool(this.permissions, this.cwdSource);
+      this.tools.git_diff = createGitDiffTool(this.permissions, this.cwdSource);
+      this.tools.git_log = createGitLogTool(this.permissions, this.cwdSource);
+      this.tools.git_add = createGitAddTool(this.permissions, this.cwdSource);
+      this.tools.git_commit = createGitCommitTool(this.permissions, this.cwdSource);
+      this.tools.git_push = createGitPushTool(this.permissions, this.cwdSource);
+      logger.info('Git tools registered');
+    }
+
+    if (isGitHubConfigured()) {
+      this.tools.create_pr = createCreatePrTool();
+      this.tools.review_pr = createReviewPrTool();
+      this.tools.list_issues = createListIssuesTool();
+      this.tools.create_issue = createCreateIssueTool();
+      this.tools.github_api = createGithubApiTool();
+      logger.info('GitHub tools registered');
+    }
+
+    this.tools.fetch_url = createFetchUrlTool({ isResearchMode: () => this.isResearchMode() });
+    this.tools.web_search = createWebSearchTool();
+    logger.info('Web fetch tool registered');
+
+    if (this.supervisor) {
+      this.tools.delegate_task = createDelegateTaskTool(this.supervisor, this);
+      this.tools.list_agents = createListAgentsTool(this.supervisor);
+      this.tools.stop_agent = createStopAgentTool(this.supervisor);
+      logger.info('Sub-agent tools registered');
+    }
+
+    this.tools.ask_user = createAskUserTool(() => this.getChannelContext());
+    this.tools.update_plan = createUpdatePlanTool();
+    logger.info('Interaction tools registered');
+  }
+
+  attachMcp(manager: McpManager): void {
+    this.mcp = manager;
+  }
+
+  async closeBrowserSessions(): Promise<void> { await this.browser?.closeAll(); }
+
+  getMcpManager(): McpManager | undefined {
+    return this.mcp;
+  }
+
+  private allTools(): Record<string, Tool> {
+    return { ...this.tools, ...this.mcp?.getTools(), ...(this.browser ? createBrowserTools(this.permissions, this.browser) : {}) };
+  }
+
+  getTools(): Record<string, Tool> {
+    if (this.toolsDisabled) return {};
+    // Untrusted content can't steer privileged actions (ADR-044): every tool
+    // set goes through the guard, for the main agent, sub-agents and bots.
+    const guard = (tools: Record<string, Tool>) => guardTools(tools, { permissions: this.permissions, notify: (text) => this.ownerNotice?.(text) });
+    // Scheduled calls (when a calling channel plugin is running): owner only.
+    if (this.permissions.getCurrentSenderRole() !== 'member' && activeCallScheduler()) {
+      return guard(this.filterSessionTools({ ...this.getToolsInner(), ...callTools() }));
+    }
+    return guard(this.filterSessionTools(this.getToolsInner()));
+  }
+
+  private getToolsInner(): Record<string, Tool> {
+    // Members on a channel that distinguishes roles (e.g. Telegram) must not be
+    // able to install skills: `install_skill` is the escalation path from chat
+    // access to arbitrary local execution and is documented as admin-only.
+    // Plugin and MCP tools are owner-installed, so members don't get them either.
+    if (this.permissions.getCurrentSenderRole() === 'member') {
+      const filtered: Record<string, Tool> = {};
+      for (const [name, tool] of Object.entries(this.tools)) {
+        if (name !== 'install_skill' && name !== 'create_skill' && !name.startsWith('browser_')) filtered[name] = tool;
+      }
+      return filtered;
+    }
+    // MCP tools sit beside the built-ins (members never get them: above).
+    return this.withPluginTools(this.allTools(), false);
+  }
+
+  /**
+   * Built-in tools plus the live plugin tools (src/plugins). Read on every
+   * call, so enabling or disabling a plugin takes effect on the next turn.
+   * A built-in tool always wins a name clash.
+   */
+  private withPluginTools(base: Record<string, Tool>, readOnlyOnly: boolean): Record<string, Tool> {
+    const plugin = getPluginTools(this.permissions, { readOnlyOnly });
+    if (Object.keys(plugin).length === 0) return base;
+    const merged: Record<string, Tool> = { ...base };
+    for (const [name, tool] of Object.entries(plugin)) {
+      if (!(name in merged)) merged[name] = tool;
+    }
+    return merged;
+  }
+
+  /** Return tools filtered for plan mode — read-only tools only */
+  getPlanTools(): Record<string, Tool> {
+    if (this.toolsDisabled) return {};
+    const blocked = new Set([
+      'write_file', 'create_file', 'delete_file', 'edit_file',
+      'run_command', 'cd',
+      'git_add', 'git_commit', 'git_push',
+      'create_pr', 'create_issue',
+      'delegate_task',
+      'browser_navigate', 'browser_snapshot', 'browser_close',
+    ]);
+    const filtered: Record<string, Tool> = {};
+    for (const [name, tool] of Object.entries(this.tools)) {
+      if (!blocked.has(name)) filtered[name] = tool;
+    }
+    // Plan mode: only plugin tools their manifest declares read-only.
+    if (this.permissions.getCurrentSenderRole() === 'member') return this.filterSessionTools(filtered);
+    return this.filterSessionTools(this.withPluginTools(filtered, true));
+  }
+
+  getToolNames(): string[] {
+    return Object.keys(this.allTools());
+  }
+
+  getSkillContext(): string {
+    return this.skillLoader?.getSkillSummariesText() || '';
+  }
+}
+
+/** Tools for scheduled calls (the time is worked out in code, not by the model). */
+function callTools(): Record<string, Tool> {
+  return {
+    schedule_call: tool({
+      description:
+        'Schedule Mercury to call the owner on WhatsApp later, e.g. "call me at 9pm about the deploy", "call me back in 20 minutes", "call me tomorrow 8:30am". ' +
+        'Pass the time exactly as the owner said it (e.g. "9pm", "after 9 PM", "in 20 minutes", "tomorrow 8:30am"); it is converted in code. ' +
+        'Tell the owner the confirmation it returns (it has the exact time). For "call me when X is done", do X first, then call call_owner.',
+      inputSchema: zodSchema(z.object({
+        when: z.string().min(1).max(80).describe('The time as the owner said it'),
+        topic: z.string().max(300).optional().describe('What the call is about, in a few words'),
+      })),
+      execute: async ({ when, topic }) => {
+        const s = activeCallScheduler();
+        if (!s) return 'Calls need the WhatsApp plugin, linked and running.';
+        try {
+          return s.schedule(when, topic ?? '').confirmation;
+        } catch (err) {
+          return `Couldn't schedule: ${(err as Error).message}`;
+        }
+      },
+    }),
+    list_scheduled_calls: tool({
+      description: 'List the calls Mercury has scheduled to the owner.',
+      inputSchema: zodSchema(z.object({})),
+      execute: async () => {
+        const list = activeCallScheduler()?.list() ?? [];
+        return list.length ? list.map((c, i) => `${i + 1}. ${describeTime(new Date(c.at))}: ${c.topic} (id ${c.id})`).join('\n') : 'No calls scheduled.';
+      },
+    }),
+    cancel_scheduled_call: tool({
+      description: 'Cancel a scheduled call by its number in list_scheduled_calls, its id, or "all".',
+      inputSchema: zodSchema(z.object({ which: z.string().min(1).max(40) })),
+      execute: async ({ which }) => {
+        const n = activeCallScheduler()?.cancel(which.toLowerCase()) ?? 0;
+        return n ? `Cancelled ${n} call${n === 1 ? '' : 's'}.` : 'No scheduled call matches that.';
+      },
+    }),
+  };
+}

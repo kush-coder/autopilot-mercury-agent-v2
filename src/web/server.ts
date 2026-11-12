@@ -1,0 +1,346 @@
+import { Hono } from 'hono';
+import mediaRoutes from './api/media.js';
+import { isBunVirtualPath } from '../utils/bun-path.js';
+import { createAdaptorServer } from '@hono/node-server';
+import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { join, dirname, extname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { logger } from '../utils/logger.js';
+import { authGuard, errorHandler } from './middleware.js';
+import { apiCors } from './cors.js';
+import { initWebAuth, getWebPort } from './auth.js';
+import { loadConfig } from '../utils/config.js';
+import authRoutes from './api/auth.js';
+import statusRoutes, { updateStatus } from './api/status.js';
+import providerRoutes from './api/providers.js';
+import cloudRoutes from './api/cloud.js';
+import transcribeRoutes from './api/transcribe.js';
+import speakRoutes from './api/speak.js';
+import budgetRoutes, { setBudgetControls } from './api/budget.js';
+import channelRoutes from './api/channels.js';
+import artifactRoutes from './api/artifacts.js';
+import configRoutes from './api/config.js';
+import systemRoutes, { setScheduler } from './api/system.js';
+import brainRoutes, { setUserMemory } from './api/brain.js';
+import chatRoutes, { setWebChannel, setProgrammingMode, setModelSwitchCallback, setCurrentProviderCallback, setStatusSnapshotCallback, setSessionRepository, setSessionSyncEnabledCallback, setStopCallback, setSessionBusyLookup, setQueueControls, setResearchControls, setTurnControls } from './api/chat.js';
+import agentRoutes, { setAgentSupervisor, setBackgroundTaskManager } from './api/agents.js';
+import botsRoutes, { setBotManager, setBotsWebhookSecret } from './api/bots.js';
+import spotifyRoutes, { setSpotifyClient } from './api/spotify.js';
+import kanbanRoutes, { setKanbanSupervisor, setKanbanBoardManager, setKanbanProviders } from './api/kanban.js';
+import ideRoutes, { setIDEProviders } from './api/workspace-ide.js';
+import lifecycleRoutes, { setShutdownHandler } from './api/lifecycle.js';
+import mcpRoutes, { setMcpManager } from './api/mcp.js';
+import pluginRoutes from './api/plugins.js';
+import voiceRoutes from './api/voice.js';
+import deviceRoutes from './api/devices.js';
+import securityRoutes from './api/security.js';
+import updatesRoutes from './api/updates.js';
+import { bodyLimit } from 'hono/body-limit';
+import { migrateDevices } from './devices.js';
+import { BoardManager } from '../core/board-manager.js';
+import { isBetterSqlite3Available } from '../memory/second-brain-db.js';
+
+export { setSessionRepository };
+export { setBudgetControls };
+export { setSessionSyncEnabledCallback };
+
+const app = new Hono();
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function readCorsOrigins(): string[] {
+  try {
+    const list = loadConfig().web?.corsOrigins;
+    return Array.isArray(list) ? list.filter((o): o is string => typeof o === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function resolveWebDir(subpath: string): string {
+  const envVar = subpath === 'static' ? process.env.MERCURY_WEB_STATIC : process.env.MERCURY_UI_DIR;
+  if (envVar) return envVar;
+
+  // When running as a Bun --compile standalone binary, __dirname points to
+  // Bun's virtual filesystem ($bunfs).  The web assets are shipped alongside
+  // the binary in a `web/` directory, so resolve relative to the binary itself.
+  // On Windows the virtual root is `B:\~BUN\root` rather than `$bunfs`.
+  if (isBunVirtualPath(__dirname)) {
+    return join(dirname(process.execPath), 'web', subpath);
+  }
+
+  return join(__dirname, 'web', subpath);
+}
+
+const staticDir = resolveWebDir('static');
+const uiDir = resolveWebDir('ui');
+
+const MIME_TYPES: Record<string, string> = {
+  css: 'text/css',
+  js: 'application/javascript',
+  png: 'image/png',
+  ico: 'image/x-icon',
+  svg: 'image/svg+xml',
+  woff2: 'font/woff2',
+  html: 'text/html',
+  json: 'application/json',
+  wasm: 'application/wasm',
+  webmanifest: 'application/manifest+json',
+  map: 'application/json',
+};
+
+// Check if the React SPA build exists
+const spaIndexPath = join(uiDir, 'index.html');
+const spaAvailable = existsSync(spaIndexPath);
+
+app.use('*', errorHandler);
+// Baseline headers on everything; pages also refuse to be framed (clickjacking).
+app.use('*', async (c, next) => {
+  await next();
+  c.res.headers.set('X-Content-Type-Options', 'nosniff');
+  c.res.headers.set('Referrer-Policy', 'no-referrer');
+  if ((c.res.headers.get('Content-Type') ?? '').startsWith('text/html')) {
+    c.res.headers.set('X-Frame-Options', 'DENY');
+    if (!c.res.headers.has('Content-Security-Policy')) c.res.headers.set('Content-Security-Policy', "frame-ancestors 'none'");
+  }
+});
+// Sign-in bodies are tiny: refuse big ones before reading them (they arrive without a credential).
+app.use('/api/auth/*', bodyLimit({ maxSize: 64 * 1024, onError: (c) => c.json({ error: 'Request too large' }, 413) }));
+app.use('/login', bodyLimit({ maxSize: 64 * 1024, onError: (c) => c.text('Request too large', 413) }));
+// CORS before the guard: a preflight (OPTIONS) carries no credential and
+// must be answered, not rejected. API routes only; the dashboard itself is
+// same-origin.
+app.use('/api/*', apiCors(readCorsOrigins()));
+app.use('*', authGuard);
+
+// ── API routes (always available) ──
+app.route('/', authRoutes);
+app.route('/', statusRoutes);
+app.route('/', providerRoutes);
+app.route('/', cloudRoutes);
+app.route('/', transcribeRoutes);
+app.route('/', speakRoutes);
+app.route('/', mediaRoutes);
+app.route('/', budgetRoutes);
+app.route('/', channelRoutes);
+app.route('/', artifactRoutes);
+app.route('/', configRoutes);
+app.route('/', systemRoutes);
+app.route('/', brainRoutes);
+app.route('/', chatRoutes);
+app.route('/', agentRoutes);
+app.route('/', botsRoutes);
+app.route('/', spotifyRoutes);
+app.route('/', kanbanRoutes);
+app.route('/', ideRoutes);
+app.route('/', lifecycleRoutes);
+app.route('/', mcpRoutes);
+app.route('/', pluginRoutes);
+app.route('/', voiceRoutes);
+app.route('/', deviceRoutes);
+app.route('/', securityRoutes);
+app.route('/', updatesRoutes);
+
+// ── Legacy static assets (vendor fonts, icons, wasm — still needed by React SPA) ──
+app.get('/vendor/*', (c) => {
+  const subPath = c.req.path.slice('/vendor/'.length);
+  if (!subPath || subPath.includes('..')) return c.notFound();
+  const filePath = join(staticDir, 'vendor', subPath);
+  if (existsSync(filePath)) {
+    const ext = subPath.split('.').pop() || '';
+    return new Response(readFileSync(filePath), {
+      headers: { 'Content-Type': MIME_TYPES[ext] || 'application/octet-stream' },
+    });
+  }
+  return c.notFound();
+});
+
+if (spaAvailable) {
+  // ═══════════════════════════════════════════════════════════════
+  // React SPA mode — serve Vite build output
+  // ═══════════════════════════════════════════════════════════════
+
+  // Serve static assets from the SPA build (JS, CSS, etc.)
+  app.get('/assets/*', (c) => {
+    const subPath = c.req.path.slice('/assets/'.length);
+    if (!subPath || subPath.includes('..')) return c.notFound();
+    const filePath = join(uiDir, 'assets', subPath);
+    if (existsSync(filePath)) {
+      const ext = subPath.split('.').pop() || '';
+      return new Response(readFileSync(filePath), {
+        headers: {
+          'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
+          'Cache-Control': 'public, max-age=31536000, immutable',
+        },
+      });
+    }
+    return c.notFound();
+  });
+
+  // Serve top-level SPA files (favicon, manifest, service worker, etc.)
+  const SPA_TOP_LEVEL_FILES = ['favicon.svg', 'favicon.ico', 'manifest.webmanifest', 'registerSW.js', 'sw.js', 'sw.js.map', 'robots.txt', 'logo-dark.png', 'logo-light.png', 'logo-full-dark.png', 'logo-full-light.png'];
+
+  // Also pick up workbox files dynamically
+  try {
+    const uiFiles = readdirSync(uiDir);
+    for (const f of uiFiles) {
+      if (f.startsWith('workbox-') && !SPA_TOP_LEVEL_FILES.includes(f)) {
+        SPA_TOP_LEVEL_FILES.push(f);
+      }
+    }
+  } catch {}
+
+  for (const fileName of SPA_TOP_LEVEL_FILES) {
+    app.get(`/${fileName}`, (c) => {
+      const filePath = join(uiDir, fileName);
+      if (existsSync(filePath)) {
+        const ext = fileName.split('.').pop() || '';
+        return new Response(readFileSync(filePath), {
+          headers: { 'Content-Type': MIME_TYPES[ext] || 'application/octet-stream' },
+        });
+      }
+      return c.notFound();
+    });
+  }
+
+  // Serve PWA icon directory
+  app.get('/icons/*', (c) => {
+    const subPath = c.req.path.slice('/icons/'.length);
+    if (!subPath || subPath.includes('..')) return c.notFound();
+    const filePath = join(uiDir, 'icons', subPath);
+    if (existsSync(filePath)) {
+      const ext = subPath.split('.').pop() || '';
+      return new Response(readFileSync(filePath), {
+        headers: { 'Content-Type': MIME_TYPES[ext] || 'application/octet-stream' },
+      });
+    }
+    return c.notFound();
+  });
+
+  // SPA catch-all: serve index.html for all non-API, non-asset routes
+  // This enables client-side routing via React Router
+  app.get('*', (c) => {
+    // Don't catch API routes
+    if (c.req.path.startsWith('/api/')) return c.notFound();
+
+    // Serve top-level static files from ui dir if they exist
+    const reqPath = c.req.path.slice(1); // strip leading /
+    if (reqPath && !reqPath.includes('/') && !reqPath.includes('..')) {
+      const filePath = join(uiDir, reqPath);
+      if (existsSync(filePath)) {
+        const ext = reqPath.split('.').pop() || '';
+        return new Response(readFileSync(filePath), {
+          headers: {
+            'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
+            'Cache-Control': 'public, max-age=3600',
+          },
+        });
+      }
+    }
+
+    return new Response(readFileSync(spaIndexPath), {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+      },
+    });
+  });
+
+} else {
+  // React SPA not built — return helpful message for all routes
+  app.get('*', (c) => {
+    if (c.req.path.startsWith('/api/')) return c.notFound();
+    return c.text('Mercury web UI not found. If running from source, run: npm run build\nIf running a standalone binary, ensure the web/ directory is next to the binary.', 500);
+  });
+}
+
+export { setShutdownHandler, setMcpManager };
+export { setStopCallback, setSessionBusyLookup, setQueueControls, setResearchControls, setTurnControls };
+export { updateStatus, setUserMemory, setWebChannel, setScheduler, setAgentSupervisor, setBackgroundTaskManager, setSpotifyClient, setProgrammingMode, setModelSwitchCallback, setCurrentProviderCallback, setStatusSnapshotCallback, setKanbanSupervisor, setKanbanBoardManager, setKanbanProviders, setIDEProviders, setBotManager, setBotsWebhookSecret };
+
+let webServer: ReturnType<typeof createAdaptorServer> | null = null;
+
+// Ensure web server is always terminated with the Mercury process
+process.on('exit', () => {
+  if (webServer) {
+    try { webServer.close(); } catch {}
+    webServer = null;
+  }
+});
+
+process.on('uncaughtException', (err) => {
+  logger.error({ err: err.message }, 'Uncaught exception in web server');
+  // Write crash flag so next startup can report to the user.
+  try {
+    const { writeCrashFlag } = require('../core/crash-flag.js');
+    writeCrashFlag({ reason: `Uncaught exception: ${err.message}`.slice(0, 300), timestamp: Date.now() });
+  } catch { /* best effort */ }
+});
+
+process.on('unhandledRejection', (reason: any) => {
+  // Never swallow fatal boot errors (e.g. "runtime already running") here —
+  // a silent exit(0) with no user-visible reason is worse than a crash.
+  logger.error({ err: reason?.message || reason }, 'Unhandled rejection');
+  try {
+    const { writeCrashFlag } = require('../core/crash-flag.js');
+    writeCrashFlag({ reason: `Unhandled rejection: ${reason?.message || reason}`.slice(0, 300), timestamp: Date.now() });
+  } catch { /* best effort */ }
+  const message = String(reason?.message || reason || '');
+  const fatal = /already running|EADDRINUSE|registerRuntimeProcess/i.test(message);
+  if (fatal) {
+    try {
+      process.stderr.write(`\n✗ Mercury cannot start: ${message}\n  Attach to it with \`mercury attach\`, or stop it with \`mercury stop\` / \`kill <pid>\`.\n`);
+    } catch { /* stderr gone */ }
+    process.exit(1);
+  }
+});
+
+export function startWebServer(): { port: number; url: string } {
+  const port = getWebPort();
+  initWebAuth();
+  // Devices from before idle expiry start their clock now (they keep working).
+  try { migrateDevices(); } catch { /* checked again next start */ }
+
+  if (spaAvailable) {
+    logger.info(`React UI loaded from: ${uiDir}`);
+  } else {
+    logger.info('React UI not found, using legacy Alpine.js UI');
+  }
+
+  const server = createAdaptorServer({ fetch: app.fetch });
+  webServer = server;
+
+  let bindAttempts = 0;
+  server.on('error', (err: any) => {
+    if (err?.code === 'EADDRINUSE' && bindAttempts < 10) {
+      // A previous instance shutting down keeps the port for a moment;
+      // retry before declaring the dashboard unavailable.
+      bindAttempts++;
+      setTimeout(() => server.listen(port, '127.0.0.1'), 500);
+      return;
+    }
+    if (err?.code === 'EADDRINUSE') {
+      // The runtime stays alive for its channels, but with no web listener
+      // every attach health check fails — the launcher treats that as an
+      // unresponsive runtime and restarts it. Log the shape of that state.
+      logger.warn(`Port ${port} is already in use — web dashboard unavailable. Attach/launch will report the runtime as unresponsive and restart it.`);
+    } else {
+      logger.error({ err: err.message }, 'Web server error');
+    }
+  });
+
+  server.listen(port, '127.0.0.1', () => {
+    logger.info(`Web dashboard: http://127.0.0.1:${port}`);
+  });
+
+  return { port, url: `http://127.0.0.1:${port}` };
+}
+
+export function stopWebServer(): Promise<void> {
+  return new Promise((resolve) => {
+    if (!webServer) return resolve();
+    webServer.close(() => resolve());
+    // Force-close connections after 2s
+    setTimeout(() => resolve(), 2000);
+  });
+}

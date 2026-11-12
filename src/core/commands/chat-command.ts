@@ -1,0 +1,2048 @@
+/**
+ * Slash-command dispatcher for chat surfaces (/help, /status, /model, /memory, /sessions, /new, /trace, /reset, …).
+ * Moved out of Agent (P2.1 split); `agent` is the Agent instance.
+ */
+import type { Agent } from '../agent.js';
+import {
+  approveTelegramPendingRequest,
+  approveTelegramPendingRequestByPairingCode,
+  clearTelegramAccess,
+  demoteTelegramAdmin,
+  getTelegramAccessSummary,
+  getTelegramApprovedUsers,
+  getTelegramPendingRequests,
+  promoteTelegramUserToAdmin,
+  rejectTelegramPendingRequest,
+  removeTelegramUser,
+  saveConfig,
+  loadConfig,
+  getActiveProviders,
+  getDiscordAccessSummary,
+  hasDiscordAdmins,
+  findDiscordPendingRequest,
+  approveDiscordPendingRequest,
+  approveDiscordPendingRequestByPairingCode,
+  rejectDiscordPendingRequest as rejectDiscordPendingRequestConfig,
+  removeDiscordUser,
+  clearDiscordAccess,
+  getSlackAccessSummary,
+  hasSlackAdmins,
+  findSlackPendingRequest,
+  approveSlackPendingRequest,
+  approveSlackPendingRequestByPairingCode,
+  rejectSlackPendingRequest as rejectSlackPendingRequestConfig,
+  removeSlackUser,
+  clearSlackAccess,
+} from '../../utils/config.js';
+import { MAX_STEPS } from '../agent.js';
+import { displayModelName, effortFor, effortLabel, setChatEffort, setModelPref, type ReasoningLevel } from '../../utils/model-prefs.js';
+import { discoverReasoningCaps } from '../../providers/reasoning-discovery.js';
+import { mediaService } from '../../media/runtime.js';
+import { setMediaDefault, setSpeechPrefs } from '../../media/prefs.js';
+import { getSpeechService, type SpeechService } from '../../media/speech.js';
+import { mediaJobs } from '../../media/jobs.js';
+import { unusableReason, type MediaService } from '../../media/service.js';
+import type { MediaModel } from '../../media/catalog.js';
+import path from 'node:path';
+import type { ChannelType } from '../../types/channel.js';
+import { createProvider, ProviderRegistry as ProviderRegistryImpl } from '../../providers/registry.js';
+import { ProgrammingMode } from '../programming-mode.js';
+import { logger } from '../../utils/logger.js';
+import { CLIChannel } from '../../channels/cli.js';
+import { formatToolStep, type NarrativeStep } from '../../utils/tool-label.js';
+import { getTelegramHelp, getDiscordHelp, getSlackHelp } from '../../utils/manual.js';
+import { WebChannel } from '../../channels/web.js';
+import { describePermissionMode, loadPermissionMode, savePermissionMode } from '../../capabilities/permission-mode-store.js';
+import type { ArrowSelectOption } from '../../utils/arrow-select.js';
+import { PLAYER_CONTROLS, handlePlayerAction, formatNowPlaying } from '../../spotify/ui.js';
+import { getCloudTokenStore } from '../../cloud/token-store.js';
+import { publishStatus, updateCliProviderStatus } from '../provider-status.js';
+import { whatsNewText } from '../../utils/whats-new.js';
+import { formatMcpChatStatus } from '../../capabilities/mcp/admin.js';
+import { FORGET_THAT_RE, MEMORY_SUBCOMMAND_HELP, handleBeliefCommand } from './memory-commands.js';
+
+/**
+ * The owner's own screens: the foreground terminal (CLI channel) and the
+ * attached terminal or dashboard (web channel). Both can show an arrow-key
+ * picker; every other channel gets text. Since 1.3.1 the default launch
+ * attaches, so a picker offered only to the CLI channel was a picker nobody
+ * saw — /model made people type `/models use <name>`.
+ */
+function isOwnerScreen(channel: unknown, channelType: string): channel is CLIChannel | WebChannel {
+  return channel instanceof WebChannel || (channelType === 'cli' && channel instanceof CLIChannel);
+}
+
+/**
+ * An arrow-key choice on an owner screen. Returns the chosen label, or null
+ * when the owner dismissed it (Esc) or the screen could not show it, so a
+ * dismissed picker never silently acts on the first option.
+ */
+async function pickOnOwnerScreen(agent: Agent, channel: CLIChannel | WebChannel, channelType: string, channelId: string, question: string, labels: string[]): Promise<string | null> {
+  if (channel instanceof WebChannel) {
+    const value = await channel.presentChoicePrompt(question, labels.map((label, i) => ({ value: String(i), label })), channelId);
+    const idx = Number.parseInt(value, 10);
+    return Number.isInteger(idx) && labels[idx] !== undefined ? labels[idx] : null;
+  }
+  const picked = await agent.presentChoice(question, labels, channelId, channelType);
+  return labels.includes(picked) ? picked : null;
+}
+
+/**
+ * The Ask Me / Allow All picker on an owner screen (/permissions, and a
+ * fresh /new session). The current mode is named in the question; Esc keeps
+ * it. A pick is applied, saved and pushed to every status row.
+ */
+async function offerPermissionMode(agent: Agent, channel: CLIChannel | WebChannel, channelId: string, question: string): Promise<void> {
+  if (channel instanceof CLIChannel) {
+    const mode = await channel.askPermissionMode(loadPermissionMode() ?? undefined);
+    if (mode === 'allow-all') {
+      agent.capabilities.permissions.setAutoApproveAll(true);
+      agent.capabilities.permissions.addTempScope('/', true, true);
+    } else {
+      agent.capabilities.permissions.setAutoApproveAll(false);
+    }
+    const chosen = mode === 'allow-all' ? 'allow-all' : 'ask-me';
+    savePermissionMode(chosen);
+    channel.setPermissionModeStatus(chosen);
+    publishStatus();
+    await channel.send(`${describePermissionMode(chosen)} Saved: Mercury remembers this. Change it any time with /permissions.`, channelId);
+    return;
+  }
+  // The attached terminal and the dashboard (channel type 'web').
+  const current = loadPermissionMode() ?? (channel.getSettings().bypassPermissions ? 'allow-all' : 'ask-me');
+  const picked = await channel.presentChoicePrompt(
+    `${question} (now: ${current === 'allow-all' ? 'Allow All' : 'Ask Me'})`,
+    [
+      { value: 'ask-me', label: 'Ask Me: ask before writing files or running commands' },
+      { value: 'allow-all', label: 'Allow All: just do it (blocked commands stay blocked)' },
+    ],
+    channelId,
+  );
+  if (picked !== 'ask-me' && picked !== 'allow-all') {
+    await channel.send(`${describePermissionMode(current)} Unchanged. /permissions switches any time.`, channelId);
+    return;
+  }
+  channel.setBypassPermissions(picked === 'allow-all');
+  savePermissionMode(picked);
+  publishStatus();
+  await channel.send(`${describePermissionMode(picked)} Saved: Mercury remembers this. Change it any time with /permissions.`, channelId);
+}
+
+export async function handleChatCommand(agent: Agent, content: string, channelType: string, channelId: string): Promise<boolean> {
+  const trimmed = content.trim();
+  const cmd = trimmed.toLowerCase();
+  const channel = agent.channels.get(channelType as any);
+  if (!channel) return false;
+
+  const ctx = agent.capabilities.getChatCommandContext();
+  if (!ctx) return false;
+
+  if (cmd === '/sessions' || cmd.startsWith('/session')) {
+    await agent.handleSessionCommand(trimmed, channelType as ChannelType, channelId);
+    return true;
+  }
+
+  // /new — fresh conversation context for this chat; memory is kept.
+  // Unlike /reset this never halts agents, clears queues, or wipes state.
+  if (cmd === '/new') {
+    await agent.handleSessionCommand('/session new', channelType as ChannelType, channelId);
+    // A fresh session on the owner's own screen asks which permission mode
+    // to run in (the current one is shown; Esc keeps it).
+    if (isOwnerScreen(channel, channelType)) await offerPermissionMode(agent, channel, channelId, 'Permission mode for this session?');
+    return true;
+  }
+
+  // /trace [id] — what happened in a turn: provider, tokens, timing,
+  // verification, and every tool call. Answers "why did it do that?".
+  if (cmd === '/trace' || cmd.startsWith('/trace ')) {
+    await channel.send(agent.renderTrace(channelType as ChannelType, channelId, trimmed.slice('/trace'.length).trim()), channelId);
+    return true;
+  }
+
+  if (cmd === '/help') {
+    const helpText = channelType === 'telegram' ? getTelegramHelp() : channelType === 'discord' ? getDiscordHelp() : channelType === 'slack' ? getSlackHelp() : ctx.manual();
+    await channel.send(helpText, channelId);
+    return true;
+  }
+
+  if (cmd === '/whatsnew' || cmd.startsWith('/whatsnew ')) {
+    // Curated highlights for the running version — one friendly block,
+    // exhaustive notes stay in CHANGELOG.md / the releases page.
+    const runningVersion = channelType === 'cli' && channel instanceof CLIChannel
+      ? (channel.getTuiState().version || 'dev')
+      : 'dev';
+    // The signed update manifest's notes for this version, when it has them.
+    const { readManifestCache, latestFor } = await import('../../updates/manifest.js');
+    const cached = readManifestCache().manifest;
+    const release = [latestFor(cached, 'server', 'stable'), latestFor(cached, 'server', 'dev')].find((r) => r && r.version === runningVersion.replace(/^v/, '') && r.notes);
+    const text = release?.notes ? `${release.notes}${release.notesUrl ? `\n\n${release.notesUrl}` : ''}` : whatsNewText(runningVersion);
+    await channel.send(text, channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+    return true;
+  }
+
+  if (cmd.startsWith('/update')) {
+    const sub = trimmed.slice('/update'.length).trim().toLowerCase();
+    if (sub === 'ignore') {
+      const { latestSeenUpdate, ignoreUpdateVersion, getIgnoredUpdateVersion } = await import('../../cli/update-notice.js');
+      const runningVersion = channelType === 'cli' && channel instanceof CLIChannel
+        ? (channel.getTuiState().version || 'dev')
+        : 'dev';
+      const { readManifestCache, requiredFor } = await import('../../updates/manifest.js');
+      const required = requiredFor(readManifestCache().manifest, 'server', runningVersion);
+      if (required) {
+        await channel.send(`This update is required and can't be ignored: ${required.reason} Run \`mercury upgrade\` in your terminal; it goes back on its own if anything fails.`, channelId);
+        return true;
+      }
+      const target = latestSeenUpdate(runningVersion);
+      if (!target) {
+        await channel.send('Nothing to ignore — no update was offered for this version.', channelId);
+        return true;
+      }
+      if (getIgnoredUpdateVersion() === target) {
+        await channel.send(`Update to v${target} is already ignored.`, channelId);
+        return true;
+      }
+      ignoreUpdateVersion(target);
+      if (channel instanceof CLIChannel) channel.setUpdateAvailable(null);
+      await channel.send(`Ignored — update notices for v${target} are silenced permanently. \`mercury upgrade\` in the terminal still works whenever you want it.`, channelId);
+      return true;
+    }
+    await channel.send('Usage: `/update ignore` — permanently silence the offered update notice.', channelId);
+    return true;
+  }
+
+  if (cmd === '/saver' || cmd.startsWith('/saver ')) {
+    await agent.handleSaverCommand(trimmed.slice('/saver'.length).trim(), channelType, channelId);
+    return true;
+  }
+
+  if (cmd.startsWith('/bg')) {
+    await agent.handleBgCommand(trimmed, { content: trimmed, channelId, channelType: channelType as any, id: Date.now().toString(36), senderId: 'user', timestamp: Date.now() }, channel);
+    return true;
+  }
+
+  if (cmd === '/progress' || cmd === '/still') {
+    // Here the chat itself was idle (this command is its turn), so report
+    // what the other chats are doing (ADR-037: they run at the same time).
+    const others = agent.runningTurns().filter((t) => t.channelId !== channelId);
+    if (others.length === 0) {
+      await channel.send('No active foreground task.', channelId);
+      return true;
+    }
+    const lines = others.map((t) => {
+      const elapsedSec = Math.round((Date.now() - t.startedAt) / 1000);
+      const stepInfo = t.completedSteps > 0 ? ` · step ${t.completedSteps}/${MAX_STEPS}` : '';
+      const doing = (t.activity || t.content).replace(/\s+/g, ' ').trim().slice(0, 80);
+      return `• ${t.channelType} (${elapsedSec}s${stepInfo}): ${doing}`;
+    });
+    await channel.send(`Nothing is running in this chat. Running elsewhere:\n${lines.join('\n')}`, channelId);
+    return true;
+  }
+
+  if (cmd === '/exit' || cmd === '/quit') {
+    await channel.send('Goodbye! Shutting down Mercury...', channelId);
+    agent.shutdown();
+    return true;
+  }
+
+  // Direct form: /permissions allow-all | /permissions ask-me (owner's terminal or dashboard).
+  const directMode = /^\/permissions\s+(allow-all|ask-me)$/.exec(cmd)?.[1] as 'allow-all' | 'ask-me' | undefined;
+  if (directMode && (channel instanceof WebChannel || (channelType === 'cli' && channel instanceof CLIChannel))) {
+    if (channel instanceof WebChannel) channel.setBypassPermissions(directMode === 'allow-all');
+    else {
+      agent.capabilities.permissions.setAutoApproveAll(directMode === 'allow-all');
+      if (directMode === 'allow-all') agent.capabilities.permissions.addTempScope('/', true, true);
+      if (channel instanceof CLIChannel) channel.setPermissionModeStatus(directMode);
+    }
+    savePermissionMode(directMode);
+    publishStatus();
+    await channel.send(`${describePermissionMode(directMode)} Saved.`, channelId);
+    return true;
+  }
+
+  if (cmd === '/permissions') {
+    if (isOwnerScreen(channel, channelType)) {
+      await offerPermissionMode(agent, channel, channelId, 'How should Mercury handle risky actions?');
+      return true;
+    }
+    await channel.send('On Telegram, use the /permissions button or command. Your own terminal and dashboard use /permissions too.', channelId);
+    return true;
+  }
+
+  if (cmd === '/status') {
+    const config = ctx.config();
+    const budget = ctx.tokenBudget();
+    const saver = agent.saverMode.getState();
+    const saverLine = saver === 'off'
+      ? `Saver: off (auto at ${agent.saverMode.getAutoThreshold()}%)`
+      : `Saver: ${saver.toUpperCase()} · saved today ~${agent.tokenBudget.getSavedToday().toLocaleString()} tokens`;
+    const lines = [
+      `**${config.identity.name}** — Status`,
+      `Owner: ${config.identity.owner || '(not set)'}`,
+      `Provider: ${config.providers.default}`,
+      `Telegram: ${config.channels.telegram.enabled ? 'enabled' : 'disabled'}`,
+      `Telegram access: ${getTelegramAccessSummary(config)}`,
+      `Discord: ${config.channels.discord.enabled ? 'enabled' : 'disabled'}`,
+      `Discord access: ${getDiscordAccessSummary(config)}`,
+      `Slack: ${config.channels.slack.enabled ? 'enabled' : 'disabled'}`,
+      `Slack access: ${getSlackAccessSummary(config)}`,
+      `Budget: ${budget.getStatusText()}`,
+      saverLine,
+      effortStatusLine(agent),
+      `Skills: ${ctx.skillNames().length > 0 ? ctx.skillNames().join(', ') : 'none'}`,
+    ];
+    await channel.send(lines.join('\n'), channelId);
+    return true;
+  }
+
+  if (cmd === '/media' || cmd.startsWith('/media ') || cmd === '/image' || cmd === '/imagine' || cmd === '/img' || cmd === '/video' || cmd === '/music' || cmd === '/song') {
+    const media = mediaService();
+    if (!media) {
+      await channel.send('Media generation is not available in this process.', channelId);
+      return true;
+    }
+    const arg = cmd.startsWith('/media') ? trimmed.slice('/media'.length).trim() : '';
+    const reply = await mediaCommand(media, arg, getSpeechService());
+    await channel.send(reply.text, channelId);
+    // On an owner screen, offer the models as a picker.
+    if (reply.pick && isOwnerScreen(channel, channelType) && reply.pick.length > 1) {
+      const labels = [...reply.pick.map((m) => `${m.label} · ${m.group}`), 'Automatic', 'Keep as is'];
+      const picked = await pickOnOwnerScreen(agent, channel, channelType, channelId, 'Default image model?', labels);
+      if (picked && picked !== 'Keep as is') {
+        const chosen = picked === 'Automatic' ? null : reply.pick[labels.indexOf(picked)]?.ref ?? null;
+        setMediaDefault('image', chosen);
+        await channel.send(chosen ? `Images now use **${picked}**.` : 'Images now use the best model available automatically.', channelId);
+      }
+    }
+    return true;
+  }
+
+  if (cmd === '/effort' || cmd.startsWith('/effort ')) {
+    await channel.send(await effortCommand(agent, trimmed.slice('/effort'.length).trim().toLowerCase()), channelId);
+    return true;
+  }
+
+  if (cmd === '/models' || cmd === '/model' || cmd.startsWith('/models ') || cmd.startsWith('/model ')) {
+    const base = cmd.startsWith('/model ') || cmd === '/model' ? '/model' : '/models';
+    const rawArgs = trimmed.slice(base.length).trim();
+    const activeProviders = getActiveProviders(agent.config);
+    const current = agent.providers.getDefault();
+
+    if (!rawArgs) {
+      const lines = [
+        '**Session Models**',
+        '',
+        ...activeProviders.map((p) => {
+          const marker = p.name === current.name ? ' ← current' : '';
+          return `• ${p.name} · ${p.model}${marker}`;
+        }),
+        '',
+        'Use `/models use <provider>` to switch the default (saved across restarts).',
+        'Use `mercury doctor` to add/configure models.',
+      ];
+      await channel.send(lines.join('\n'), channelId);
+
+      if (activeProviders.length > 1 && isOwnerScreen(channel, channelType)) {
+        const choices = [
+          ...activeProviders.map((p) => `${p.name} · ${p.model}${p.name === current.name ? ' (current)' : ''}`),
+          'Open doctor instructions',
+          'Keep current model',
+        ];
+        const picked = await pickOnOwnerScreen(agent, channel, channelType, channelId, 'Switch session model?', choices);
+        if (picked === null || picked === 'Keep current model') return true;
+        if (picked === 'Open doctor instructions') {
+          await channel.send('Run `mercury doctor` and update provider/model settings. Then restart Mercury to persist defaults.', channelId);
+          return true;
+        }
+        const providerName = picked.split(' · ')[0].trim();
+        if (providerName && providerName !== current.name) {
+          const switched = await agent.switchSessionProvider(providerName);
+          await channel.send(switched.message, channelId);
+        }
+      }
+      return true;
+    }
+
+    if (rawArgs === 'doctor' || rawArgs === 'add') {
+      await channel.send('Use `mercury doctor` to add/configure models. Then use `/models` to switch active session model.', channelId);
+      return true;
+    }
+
+    const target = rawArgs.replace(/^use\s+/i, '').trim();
+    if (!target) {
+      await channel.send('Usage: `/models` or `/models use <provider>`', channelId);
+      return true;
+    }
+
+    const switched = await agent.switchSessionProvider(target);
+    await channel.send(switched.message, channelId);
+    return true;
+  }
+
+  if (cmd === '/cloud' || cmd.startsWith('/cloud ')) {
+    const cfg = ctx.config();
+    if (!cfg.cloud.enabled || !cfg.cloud.jwt) {
+      await channel.send('Mercury Cloud is not connected. Run `mercury cloud connect` to set it up.', channelId);
+      return true;
+    }
+
+    const sub = trimmed.slice('/cloud'.length).trim();
+
+    const ensureFreshToken = async (): Promise<string> => {
+      try {
+        const store = getCloudTokenStore();
+        if (store) {
+          return await store.rotateIfExpired();
+        }
+        const parts = cfg.cloud.jwt.split('.');
+        if (parts.length === 3) {
+          const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+          const exp = payload.exp * 1000;
+          if (Date.now() > exp - 60_000 && cfg.cloud.refreshToken) {
+            const { refreshToken } = await import('../../cloud/pairing.js');
+            const result = await refreshToken(cfg.cloud.apiUrl, cfg.cloud.refreshToken);
+            cfg.cloud.jwt = result.jwt;
+            cfg.cloud.refreshToken = result.refreshToken;
+            cfg.providers.mercuryCloud.apiKey = result.jwt;
+            const { saveConfig } = await import('../../utils/config.js');
+            saveConfig(cfg);
+            agent.config = cfg;
+            return result.jwt;
+          }
+        }
+      } catch {}
+      return cfg.cloud.jwt;
+    };
+
+    if (!sub || sub === 'models' || sub === 'model') {
+      try {
+        const jwt = await ensureFreshToken();
+        const res = await fetch(`${cfg.cloud.apiUrl}/v1/models`, {
+          headers: { Authorization: `Bearer ${jwt}` },
+        });
+        if (!res.ok) {
+          await channel.send(`Failed to fetch cloud models (HTTP ${res.status}). Your token may have expired — run \`mercury cloud login\`.`, channelId);
+          return true;
+        }
+        const data = await res.json() as { data: Array<{ id: string; label: string; tier_required: string; context_window: number; available: boolean; is_branded?: boolean; discount_percent?: number }> };
+        const models = data.data || [];
+        if (models.length === 0) {
+          await channel.send('No models available.', channelId);
+          return true;
+        }
+
+        const currentModel = cfg.providers.mercuryCloud?.model || '—';
+        const branded = models.filter((m) => m.is_branded);
+        const raw = models.filter((m) => !m.is_branded);
+
+        const formatModel = (m: typeof models[0]) => {
+          const marker = m.id === currentModel ? ' ← current' : '';
+          const lock = m.available ? '' : ' 🔒';
+          const discount = m.discount_percent && m.discount_percent > 0 ? ` (${m.discount_percent}% off input)` : '';
+          return `• ${m.id} · ${m.label} (${m.tier_required})${discount}${lock}${marker}`;
+        };
+
+        const lines = [
+          '**Mercury Cloud Models**',
+          '',
+          '**Mercury Branded**',
+          ...branded.map(formatModel),
+          '',
+          '**Direct Models**',
+          ...raw.map(formatModel),
+          '',
+          'Use `/cloud use <model-id>` to switch.',
+        ];
+        await channel.send(lines.join('\n'), channelId);
+
+        if (isOwnerScreen(channel, channelType)) {
+          const availableModels = models.filter((m) => m.available);
+          const choices = [
+            ...availableModels.map((m) => `${m.id} · ${m.label}${m.id === currentModel ? ' (current)' : ''}`),
+            'Keep current model',
+          ];
+          if (availableModels.length <= 1) {
+            await channel.send('Only one model available for your tier. Upgrade to unlock more.', channelId);
+            return true;
+          }
+          const picked = await pickOnOwnerScreen(agent, channel, channelType, channelId, 'Switch cloud model?', choices);
+          if (picked === null || picked === 'Keep current model') return true;
+          const modelId = picked.split(' · ')[0].trim();
+          if (modelId) {
+            cfg.providers.mercuryCloud.model = modelId;
+            cfg.providers.mercuryCloud.enabled = true;
+            cfg.providers.default = 'mercuryCloud';
+            const { saveConfig } = await import('../../utils/config.js');
+            saveConfig(cfg);
+            agent.config = cfg;
+            const provider = await createProvider(cfg.providers.mercuryCloud, getCloudTokenStore());
+            agent.providers.set('mercuryCloud', provider);
+            agent.providers.setDefault('mercuryCloud');
+            updateCliProviderStatus(agent.channels.get('cli'), 'mercuryCloud', modelId);
+            await channel.send(`✓ Switched to **${modelId}**. Saved to config.`, channelId);
+          }
+        }
+      } catch (err) {
+        await channel.send(`Error fetching cloud models: ${(err as Error).message}`, channelId);
+      }
+      return true;
+    }
+
+    if (sub.startsWith('use ')) {
+      const modelId = sub.slice(4).trim();
+      if (!modelId) {
+        await channel.send('Usage: `/cloud use <model-id>`', channelId);
+        return true;
+      }
+      await ensureFreshToken();
+      try {
+        cfg.providers.mercuryCloud.model = modelId;
+        cfg.providers.mercuryCloud.enabled = true;
+        if (cfg.providers.default !== 'mercuryCloud') {
+          cfg.providers.default = 'mercuryCloud';
+        }
+        const { saveConfig } = await import('../../utils/config.js');
+        saveConfig(cfg);
+        agent.config = cfg;
+        const provider = await createProvider(cfg.providers.mercuryCloud, getCloudTokenStore());
+        agent.providers.set('mercuryCloud', provider);
+        agent.providers.setDefault('mercuryCloud');
+        updateCliProviderStatus(agent.channels.get('cli'), 'mercuryCloud', modelId);
+        await channel.send(`✓ Switched to **${modelId}**. Saved to config.`, channelId);
+      } catch (err) {
+        await channel.send(`Error switching model: ${(err as Error).message}`, channelId);
+      }
+      return true;
+    }
+
+    await channel.send('Usage: `/cloud models` to list, `/cloud use <model-id>` to switch', channelId);
+    return true;
+  }
+
+  // Owner Model (ADR-026): /memory learned|beliefs|contested|confirm|forget|correct|settle,
+  // /forget <text>, and a plain "forget that" right after a `☿ Noted:` line.
+  if (cmd.startsWith('/memory ') || cmd === '/forget' || cmd.startsWith('/forget ') || FORGET_THAT_RE.test(trimmed)) {
+    if (!agent.userMemory) {
+      if (FORGET_THAT_RE.test(trimmed)) return false; // nothing noted without a memory store; let the model answer
+      await channel.send('Second brain is not available, so there is nothing to recall or forget.', channelId);
+      return true;
+    }
+    const reply = handleBeliefCommand(
+      { beliefs: agent.userMemory.beliefs, listings: agent.lastBeliefListing, lastNoted: agent.lastNotedBeliefId },
+      channelId,
+      trimmed,
+    );
+    if (reply === null) {
+      if (FORGET_THAT_RE.test(trimmed)) return false; // no `☿ Noted:` to undo in this chat
+      await channel.send(MEMORY_SUBCOMMAND_HELP, channelId);
+      return true;
+    }
+    await channel.send(reply, channelId);
+    return true;
+  }
+
+  if (cmd === '/memory') {
+    if (!agent.userMemory) {
+      const cfg = ctx.config();
+      if (cfg.memory.secondBrain?.enabled === false) {
+        await channel.send('Second brain is disabled in configuration.', channelId);
+      } else {
+        await channel.send('Second brain dependency issue: SQLite backend (better-sqlite3) is not available.', channelId);
+      }
+      return true;
+    }
+
+    if (channelType === 'cli' && channel instanceof CLIChannel) {
+      await agent.openCliMemoryMenu(channel, channelId);
+      return true;
+    }
+
+    const choiceChannel = channel as typeof channel & { presentChoicePrompt?: (question: string, options: ArrowSelectOption[], targetId?: string) => Promise<string> };
+    if (typeof choiceChannel.presentChoicePrompt === 'function') {
+      await agent.openMemoryChoiceMenu(choiceChannel, channelId);
+      return true;
+    }
+
+    await agent.sendMemoryOverview(channel, channelId);
+    return true;
+  }
+
+  if (cmd.startsWith('/telegram')) {
+    if (channelType !== 'cli') {
+      await channel.send('`/telegram` is only available from the Mercury CLI chat.', channelId);
+      return true;
+    }
+
+    const config = ctx.config();
+    const rawSubcommand = trimmed.slice('/telegram'.length).trim();
+    if (!rawSubcommand && channel instanceof CLIChannel) {
+      await channel.withMenu(async (select) => {
+        await agent.openCliTelegramMenu(channel, channelId, select);
+      });
+      return true;
+    }
+
+    const parts = rawSubcommand.split(/\s+/).filter(Boolean);
+    const action = parts[0]?.toLowerCase() || 'help';
+    const formatTelegramUser = (user: {
+      userId: number;
+      username?: string;
+      firstName?: string;
+      pairingCode?: string;
+    }) => {
+      const username = user.username ? ` (@${user.username})` : '';
+      const firstName = user.firstName ? ` ${user.firstName}` : '';
+      const pairingCode = user.pairingCode ? ` [code: ${user.pairingCode}]` : '';
+      return `${user.userId}${username}${firstName}${pairingCode}`;
+    };
+
+    const sendTelegramOverview = async () => {
+      const lines = [
+        '**Telegram Management**',
+        '',
+        `Access: ${getTelegramAccessSummary(config)}`,
+        `Admins: ${config.channels.telegram.admins.length > 0 ? config.channels.telegram.admins.map(formatTelegramUser).join(', ') : 'none'}`,
+        `Members: ${config.channels.telegram.members.length > 0 ? config.channels.telegram.members.map(formatTelegramUser).join(', ') : 'none'}`,
+        `Pending: ${config.channels.telegram.pending.length > 0 ? config.channels.telegram.pending.map(formatTelegramUser).join(', ') : 'none'}`,
+        '',
+        'Commands:',
+        '• `/telegram pending`',
+        '• `/telegram users`',
+        '• `/telegram approve <pairing-code|user-id>`',
+        '• `/telegram reject <user-id>`',
+        '• `/telegram remove <user-id>`',
+        '• `/telegram promote <user-id>`',
+        '• `/telegram demote <user-id>`',
+        '• `/telegram reset`',
+      ];
+      await channel.send(lines.join('\n'), channelId);
+    };
+
+    if (action === 'help' || action === 'status') {
+      await sendTelegramOverview();
+      return true;
+    }
+
+    if (action === 'pending') {
+      const pending = getTelegramPendingRequests(config);
+      const lines = [
+        '**Telegram Pending Requests**',
+        '',
+        pending.length > 0 ? pending.map(formatTelegramUser).join('\n') : 'No pending Telegram requests.',
+      ];
+      await channel.send(lines.join('\n'), channelId);
+      return true;
+    }
+
+    if (action === 'users') {
+      const approved = getTelegramApprovedUsers(config);
+      const lines = [
+        '**Telegram Approved Users**',
+        '',
+        `Admins: ${config.channels.telegram.admins.length > 0 ? config.channels.telegram.admins.map(formatTelegramUser).join(', ') : 'none'}`,
+        `Members: ${config.channels.telegram.members.length > 0 ? config.channels.telegram.members.map(formatTelegramUser).join(', ') : 'none'}`,
+        '',
+        `Total approved: ${approved.length}`,
+      ];
+      await channel.send(lines.join('\n'), channelId);
+      return true;
+    }
+
+    if (action === 'approve') {
+      const value = parts[1];
+      if (!value) {
+        await channel.send('Usage: `/telegram approve <pairing-code|user-id>`', channelId);
+        return true;
+      }
+
+      let approved = approveTelegramPendingRequestByPairingCode(config, value);
+      let resultLabel = value;
+
+      if (!approved) {
+        const userId = Number(value);
+        if (!isNaN(userId)) {
+          approved = approveTelegramPendingRequest(config, userId, 'member');
+          resultLabel = userId.toString();
+        }
+      }
+
+      if (!approved) {
+        await channel.send(`No pending Telegram request found for \`${resultLabel}\`.`, channelId);
+        return true;
+      }
+
+      saveConfig(config);
+      await channel.send(`Approved Telegram user ${formatTelegramUser(approved)}.`, channelId);
+      return true;
+    }
+
+    if (action === 'reject') {
+      const value = Number(parts[1]);
+      if (isNaN(value)) {
+        await channel.send('Usage: `/telegram reject <user-id>`', channelId);
+        return true;
+      }
+
+      const rejected = rejectTelegramPendingRequest(config, value);
+      if (!rejected) {
+        await channel.send(`No pending Telegram request found for \`${value}\`.`, channelId);
+        return true;
+      }
+
+      saveConfig(config);
+      await channel.send(`Rejected Telegram request for ${formatTelegramUser(rejected)}.`, channelId);
+      return true;
+    }
+
+    if (action === 'remove') {
+      const value = Number(parts[1]);
+      if (isNaN(value)) {
+        await channel.send('Usage: `/telegram remove <user-id>`', channelId);
+        return true;
+      }
+
+      const removed = removeTelegramUser(config, value);
+      if (!removed) {
+        await channel.send(`No approved Telegram user found for \`${value}\`.`, channelId);
+        return true;
+      }
+
+      saveConfig(config);
+      await channel.send(`Removed Telegram access for ${formatTelegramUser(removed)}.`, channelId);
+      return true;
+    }
+
+    if (action === 'promote') {
+      const value = Number(parts[1]);
+      if (isNaN(value)) {
+        await channel.send('Usage: `/telegram promote <user-id>`', channelId);
+        return true;
+      }
+
+      const promoted = promoteTelegramUserToAdmin(config, value);
+      if (!promoted) {
+        await channel.send(`No Telegram member found for \`${value}\`.`, channelId);
+        return true;
+      }
+
+      saveConfig(config);
+      await channel.send(`Promoted ${formatTelegramUser(promoted)} to Telegram admin.`, channelId);
+      return true;
+    }
+
+    if (action === 'demote') {
+      const value = Number(parts[1]);
+      if (isNaN(value)) {
+        await channel.send('Usage: `/telegram demote <user-id>`', channelId);
+        return true;
+      }
+
+      const demoted = demoteTelegramAdmin(config, value);
+      if (!demoted) {
+        await channel.send('Could not demote that Telegram admin. Mercury must keep at least one admin.', channelId);
+        return true;
+      }
+
+      saveConfig(config);
+      await channel.send(`Demoted ${formatTelegramUser(demoted)} to Telegram member.`, channelId);
+      return true;
+    }
+
+    if (action === 'reset' || action === 'unpair') {
+      config.channels.telegram.admins = [];
+      config.channels.telegram.members = [];
+      config.channels.telegram.pending = [];
+      saveConfig(config);
+      await channel.send('Telegram access reset. New users can send /start to begin pairing again.', channelId);
+      return true;
+    }
+
+    await channel.send(
+    `Unknown Telegram command "${action}". Try \`/telegram\`, \`/telegram pending\`, or \`/telegram users\`.`,
+      channelId,
+    );
+    return true;
+  }
+
+  if (cmd.startsWith('/discord')) {
+    if (channelType !== 'cli') {
+      await channel.send('`/discord` is only available from the Mercury CLI chat.', channelId);
+      return true;
+    }
+
+    const config = ctx.config();
+    const rawSubcommand = trimmed.slice('/discord'.length).trim();
+    const parts = rawSubcommand.split(/\s+/).filter(Boolean);
+    const action = parts[0]?.toLowerCase() || 'help';
+    const formatDiscordUser = (user: {
+      userId: string;
+      username?: string;
+      displayName?: string;
+      pairingCode?: string;
+    }) => {
+      const username = user.username ? ` (@${user.username})` : '';
+      const displayName = user.displayName ? ` ${user.displayName}` : '';
+      const pairingCode = user.pairingCode ? ` [code: ${user.pairingCode}]` : '';
+      return `${user.userId}${username}${displayName}${pairingCode}`;
+    };
+
+    const sendDiscordOverview = async () => {
+      const lines = [
+        '**Discord Management**',
+        '',
+        `Access: ${getDiscordAccessSummary(config)}`,
+        `Admins: ${config.channels.discord.admins.length > 0 ? config.channels.discord.admins.map(formatDiscordUser).join(', ') : 'none'}`,
+        `Members: ${config.channels.discord.members.length > 0 ? config.channels.discord.members.map(formatDiscordUser).join(', ') : 'none'}`,
+        `Pending: ${config.channels.discord.pending.length > 0 ? config.channels.discord.pending.map(formatDiscordUser).join(', ') : 'none'}`,
+        '',
+        'Commands:',
+        '\u2022 `/discord pending`',
+        '\u2022 `/discord users`',
+        '\u2022 `/discord approve <pairing-code|user-id>`',
+        '\u2022 `/discord reject <user-id>`',
+        '\u2022 `/discord remove <user-id>`',
+        '\u2022 `/discord reset`',
+      ];
+      await channel.send(lines.join('\n'), channelId);
+    };
+
+    if (action === 'help' || action === 'status') {
+      await sendDiscordOverview();
+      return true;
+    }
+
+    if (action === 'pending') {
+      const pending = config.channels.discord.pending;
+      const lines = [
+        '**Discord Pending Requests**',
+        '',
+        pending.length > 0 ? pending.map(formatDiscordUser).join('\n') : 'No pending Discord requests.',
+      ];
+      await channel.send(lines.join('\n'), channelId);
+      return true;
+    }
+
+    if (action === 'users') {
+      const lines = [
+        '**Discord Approved Users**',
+        '',
+        `Admins: ${config.channels.discord.admins.length > 0 ? config.channels.discord.admins.map(formatDiscordUser).join(', ') : 'none'}`,
+        `Members: ${config.channels.discord.members.length > 0 ? config.channels.discord.members.map(formatDiscordUser).join(', ') : 'none'}`,
+        '',
+        `Total approved: ${config.channels.discord.admins.length + config.channels.discord.members.length}`,
+      ];
+      await channel.send(lines.join('\n'), channelId);
+      return true;
+    }
+
+    if (action === 'approve') {
+      const value = parts[1];
+      if (!value) {
+        await channel.send('Usage: `/discord approve <pairing-code|user-id>`', channelId);
+        return true;
+      }
+
+      let approved = approveDiscordPendingRequestByPairingCode(config, value);
+      let resultLabel = value;
+
+      if (!approved) {
+        approved = approveDiscordPendingRequest(config, value, 'member');
+        resultLabel = value;
+      }
+
+      if (!approved) {
+        await channel.send(`No pending Discord request found for \`${resultLabel}\`.`, channelId);
+        return true;
+      }
+
+      saveConfig(config);
+      await channel.send(`Approved Discord user ${formatDiscordUser(approved)}.`, channelId);
+      return true;
+    }
+
+    if (action === 'reject') {
+      const value = parts[1];
+      if (!value) {
+        await channel.send('Usage: `/discord reject <user-id>`', channelId);
+        return true;
+      }
+
+      const rejected = rejectDiscordPendingRequestConfig(config, value);
+      if (!rejected) {
+        await channel.send(`No pending Discord request found for \`${value}\`.`, channelId);
+        return true;
+      }
+
+      saveConfig(config);
+      await channel.send(`Rejected Discord request for ${formatDiscordUser(rejected)}.`, channelId);
+      return true;
+    }
+
+    if (action === 'remove') {
+      const value = parts[1];
+      if (!value) {
+        await channel.send('Usage: `/discord remove <user-id>`', channelId);
+        return true;
+      }
+
+      const removed = removeDiscordUser(config, value);
+      if (!removed) {
+        await channel.send(`No approved Discord user found for \`${value}\`.`, channelId);
+        return true;
+      }
+
+      saveConfig(config);
+      await channel.send(`Removed Discord access for ${formatDiscordUser(removed)}.`, channelId);
+      return true;
+    }
+
+    if (action === 'reset' || action === 'unpair') {
+      clearDiscordAccess(config);
+      saveConfig(config);
+      await channel.send('Discord access reset. New users can send /start in a DM to begin pairing again.', channelId);
+      return true;
+    }
+
+    await channel.send(
+      `Unknown Discord command "${action}". Try \`/discord\`, \`/discord pending\`, or \`/discord users\`.`,
+      channelId,
+    );
+    return true;
+  }
+
+  if (cmd.startsWith('/slack')) {
+    if (channelType !== 'cli') {
+      await channel.send('`/slack` is only available from the Mercury CLI chat.', channelId);
+      return true;
+    }
+
+    const config = ctx.config();
+    const rawSubcommand = trimmed.slice('/slack'.length).trim();
+    const parts = rawSubcommand.split(/\s+/).filter(Boolean);
+    const action = parts[0]?.toLowerCase() || 'help';
+    const formatSlackUser = (user: {
+      userId: string;
+      userName?: string;
+      displayName?: string;
+      pairingCode?: string;
+    }) => {
+      const userName = user.userName ? ` (@${user.userName})` : '';
+      const displayName = user.displayName ? ` ${user.displayName}` : '';
+      const pairingCode = user.pairingCode ? ` [code: ${user.pairingCode}]` : '';
+      return `${user.userId}${userName}${displayName}${pairingCode}`;
+    };
+
+    const sendSlackOverview = async () => {
+      const lines = [
+        '**Slack Management**',
+        '',
+        `Access: ${getSlackAccessSummary(config)}`,
+        `Admins: ${config.channels.slack.admins.length > 0 ? config.channels.slack.admins.map(formatSlackUser).join(', ') : 'none'}`,
+        `Members: ${config.channels.slack.members.length > 0 ? config.channels.slack.members.map(formatSlackUser).join(', ') : 'none'}`,
+        `Pending: ${config.channels.slack.pending.length > 0 ? config.channels.slack.pending.map(formatSlackUser).join(', ') : 'none'}`,
+        '',
+        'Commands:',
+        '\u2022 `/slack pending`',
+        '\u2022 `/slack users`',
+        '\u2022 `/slack approve <pairing-code|user-id>`',
+        '\u2022 `/slack reject <user-id>`',
+        '\u2022 `/slack remove <user-id>`',
+        '\u2022 `/slack reset`',
+      ];
+      await channel.send(lines.join('\n'), channelId);
+    };
+
+    if (action === 'help' || action === 'status') {
+      await sendSlackOverview();
+      return true;
+    }
+
+    if (action === 'pending') {
+      const pending = config.channels.slack.pending;
+      const lines = [
+        '**Slack Pending Requests**',
+        '',
+        pending.length > 0 ? pending.map(formatSlackUser).join('\n') : 'No pending Slack requests.',
+      ];
+      await channel.send(lines.join('\n'), channelId);
+      return true;
+    }
+
+    if (action === 'users') {
+      const lines = [
+        '**Slack Approved Users**',
+        '',
+        `Admins: ${config.channels.slack.admins.length > 0 ? config.channels.slack.admins.map(formatSlackUser).join(', ') : 'none'}`,
+        `Members: ${config.channels.slack.members.length > 0 ? config.channels.slack.members.map(formatSlackUser).join(', ') : 'none'}`,
+        '',
+        `Total approved: ${config.channels.slack.admins.length + config.channels.slack.members.length}`,
+      ];
+      await channel.send(lines.join('\n'), channelId);
+      return true;
+    }
+
+    if (action === 'approve') {
+      const value = parts[1];
+      if (!value) {
+        await channel.send('Usage: `/slack approve <pairing-code|user-id>`', channelId);
+        return true;
+      }
+
+      let approved = approveSlackPendingRequestByPairingCode(config, value);
+      let resultLabel = value;
+
+      if (!approved) {
+        approved = approveSlackPendingRequest(config, value, 'member');
+        resultLabel = value;
+      }
+
+      if (!approved) {
+        await channel.send(`No pending Slack request found for \`${resultLabel}\`.`, channelId);
+        return true;
+      }
+
+      saveConfig(config);
+      await channel.send(`Approved Slack user ${formatSlackUser(approved)}.`, channelId);
+      return true;
+    }
+
+    if (action === 'reject') {
+      const value = parts[1];
+      if (!value) {
+        await channel.send('Usage: `/slack reject <user-id>`', channelId);
+        return true;
+      }
+
+      const rejected = rejectSlackPendingRequestConfig(config, value);
+      if (!rejected) {
+        await channel.send(`No pending Slack request found for \`${value}\`.`, channelId);
+        return true;
+      }
+
+      saveConfig(config);
+      await channel.send(`Rejected Slack request for ${formatSlackUser(rejected)}.`, channelId);
+      return true;
+    }
+
+    if (action === 'remove') {
+      const value = parts[1];
+      if (!value) {
+        await channel.send('Usage: `/slack remove <user-id>`', channelId);
+        return true;
+      }
+
+      const removed = removeSlackUser(config, value);
+      if (!removed) {
+        await channel.send(`No approved Slack user found for \`${value}\`.`, channelId);
+        return true;
+      }
+
+      saveConfig(config);
+      await channel.send(`Removed Slack access for ${formatSlackUser(removed)}.`, channelId);
+      return true;
+    }
+
+    if (action === 'reset' || action === 'unpair') {
+      clearSlackAccess(config);
+      saveConfig(config);
+      await channel.send('Slack access reset. New users can send /mercury start in a DM to begin pairing again.', channelId);
+      return true;
+    }
+
+    await channel.send(
+      `Unknown Slack command "${action}". Try \`/slack\`, \`/slack pending\`, or \`/slack users\`.`,
+      channelId,
+    );
+    return true;
+  }
+
+  if ((cmd === '/' || cmd === '/menu') && channelType === 'cli' && channel instanceof CLIChannel) {
+    await agent.openCliCommandMenu(channel, channelId);
+    return true;
+  }
+
+  if (cmd === '/tools') {
+    const tools = ctx.toolNames();
+    const grouped = [
+      `**${tools.length} tools loaded:**`,
+      '',
+      ...tools.sort().map(t => `• \`${t}\``),
+    ];
+    await channel.send(grouped.join('\n'), channelId);
+    return true;
+  }
+
+  if (cmd === '/mcp' || cmd.startsWith('/mcp ')) {
+    await channel.send(formatMcpChatStatus(ctx.mcpStatus?.() ?? [], trimmed.slice('/mcp'.length).trim()), channelId);
+    return true;
+  }
+
+  if (cmd === '/skills' || cmd.startsWith('/skills ')) {
+    await agent.handleSkillsSlashCommand(trimmed, channel, channelId, ctx);
+    return true;
+  }
+
+  if (cmd.startsWith('/code')) {
+    const rawArgs = trimmed.slice('/code'.length).trim().toLowerCase();
+    const cliChannel = channelType === 'cli' && channel instanceof CLIChannel ? channel : null;
+
+    if (!rawArgs) {
+      if (cliChannel) {
+        const cwd = agent.capabilities.getCwd();
+        const entered = cliChannel.enterMercuryCode(cwd, cliChannel.getTuiState().version || 'dev');
+        if (entered.ok) {
+          // Keep the agent-side ProgrammingMode in sync with the TUI:
+          // AUTO is the default Mercury Code flow (plan and build in one
+          // pass). setProgrammingStatus pushes it to the TUI — the stale
+          // 'plan' here was overriding the TUI's AUTO in the status bar.
+          agent.programmingMode.setAuto();
+          agent.programmingMode.setProjectContext(cwd);
+          cliChannel.setProgrammingStatus(agent.programmingMode.getState(), agent.programmingMode.getProjectContext());
+          // Plain message, not a heartbeat: entering /code starts no task,
+          // so the TUI must not flip into a perpetual "Analyzing" spinner.
+          // channel.send() also clears any stale heartbeat + isThinking.
+          await channel.send('Mercury Code active (AUTO). Describe the change — I will plan and build in one flow, confirming with you only before large or consequential changes.', channelId);
+          return true;
+        }
+        await channel.send(entered.message, channelId);
+        return true;
+      }
+      await channel.send(agent.programmingMode.getStatusText(), channelId);
+      return true;
+    }
+
+    if (rawArgs === 'exit' || rawArgs === 'quit') {
+      if (cliChannel && cliChannel.getTuiState().mercuryCode) {
+        // Arm the inline confirmation; the TUI resolves it (Esc cancels,
+        // Enter/`y` confirms, Ctrl+D force-quits without asking).
+        cliChannel.setMercuryCodeExitConfirm(true);
+        return true;
+      }
+      agent.programmingMode.setOff();
+      if (cliChannel) cliChannel.setProgrammingStatus(agent.programmingMode.getState(), agent.programmingMode.getProjectContext());
+      await channel.send('Programming mode: **Off**\nBack to normal conversation mode.', channelId);
+      return true;
+    }
+
+    if (rawArgs === 'status') {
+      await channel.send(agent.programmingMode.getStatusText(), channelId);
+      return true;
+    }
+
+    if (rawArgs === 'workspace' || rawArgs === 'ws') {
+      if (!cliChannel) {
+        await channel.send('Workspace IDE mode is currently available in CLI only.', channelId);
+        return true;
+      }
+      const current = agent.capabilities.getCwd();
+      const opened = cliChannel.openWorkspace(current);
+      if (opened.ok) {
+        agent.programmingMode.setExecute();
+        cliChannel.setProgrammingStatus(agent.programmingMode.getState(), agent.programmingMode.getProjectContext());
+        await channel.send(`${opened.message}\nWorkspace IDE mode enabled.`, channelId);
+      } else {
+        await channel.send(opened.message, channelId);
+      }
+      return true;
+    }
+
+    if (rawArgs === 'auto') {
+      agent.programmingMode.setAuto();
+      if (cliChannel) cliChannel.setProgrammingStatus(agent.programmingMode.getState(), agent.programmingMode.getProjectContext());
+      await channel.send('Programming mode: **Auto**\nI plan and build in one flow — reading first, implementing immediately, and asking for confirmation only before large or consequential changes. Use `/code off` to exit.', channelId);
+      return true;
+    }
+
+    if (rawArgs === 'plan') {
+      agent.programmingMode.setPlan();
+      if (cliChannel) cliChannel.setProgrammingStatus(agent.programmingMode.getState(), agent.programmingMode.getProjectContext());
+      await channel.send('Programming mode: **Plan**\nI will explore, analyze, and present a plan before writing any code. Use `/code execute` or `/code auto` to switch to execution.', channelId);
+      return true;
+    }
+
+    if (rawArgs === 'execute' || rawArgs === 'exec') {
+      agent.programmingMode.setExecute();
+      if (cliChannel) cliChannel.setProgrammingStatus(agent.programmingMode.getState(), agent.programmingMode.getProjectContext());
+      await channel.send('Programming mode: **Execute**\nI will implement the plan step by step, verifying with builds/tests. Use `/code off` to exit.', channelId);
+      return true;
+    }
+
+    if (rawArgs === 'build') {
+      agent.programmingMode.setExecute();
+      if (cliChannel) cliChannel.setProgrammingStatus(agent.programmingMode.getState(), agent.programmingMode.getProjectContext());
+      await channel.send('Programming mode: **Build**\nExecution mode is active for implementation/build tasks.', channelId);
+      return true;
+    }
+
+    if (rawArgs.startsWith('agent ') || rawArgs.startsWith('delegate ')) {
+      if (!agent.supervisor) {
+        await channel.send('Sub-agents are not enabled in this environment.', channelId);
+        return true;
+      }
+      const taskDescription = rawArgs.replace(/^(agent|delegate)\s+/, '').trim();
+      if (!taskDescription) {
+        await channel.send('Usage: `/code agent <task>`', channelId);
+        return true;
+      }
+      const cwd = agent.capabilities.getCwd();
+      const agentId = await agent.supervisor.spawn({
+        task: taskDescription,
+        sourceChannelId: channelId,
+        sourceChannelType: channelType as any,
+        workingDirectory: cwd,
+      });
+      const bgId = agent.backgroundTasks.spawnAgent(taskDescription, cwd, agentId);
+      agent.syncBgTasksToTui();
+      await channel.send(`Started coding sub-agent ${agentId} in background task ${bgId}. Use /bg ${bgId} for progress.`, channelId);
+      return true;
+    }
+
+    if (rawArgs === 'off') {
+      agent.programmingMode.setOff();
+      if (cliChannel) {
+        if (cliChannel.getTuiState().mercuryCode) cliChannel.exitMercuryCode();
+        cliChannel.setProgrammingStatus(agent.programmingMode.getState(), agent.programmingMode.getProjectContext());
+      }
+      await channel.send('Programming mode: **Off**\nBack to normal conversation mode.', channelId);
+      return true;
+    }
+
+    if (rawArgs === 'toggle') {
+      const newState = agent.programmingMode.toggle();
+      const labels: Record<string, string> = { off: 'Off', auto: 'Auto', plan: 'Plan', execute: 'Execute' };
+      if (cliChannel) cliChannel.setProgrammingStatus(agent.programmingMode.getState(), agent.programmingMode.getProjectContext());
+      await channel.send(`Programming mode: **${labels[newState]}**`, channelId);
+      return true;
+    }
+
+    if (rawArgs === 'init') {
+      // Ask the agent itself to write/maintain AGENTS.md for this repo.
+      await channel.send('Scanning the repository and writing AGENTS.md...', channelId);
+      await agent.processInternalPrompt(
+        'You are in Mercury Code (/code). Create or refresh the repo-level AGENTS.md in the current working directory. ' +
+        'Read the repo structure: package manifests, build config, CI, test setup, directory layout. ' +
+        'AGENTS.md must contain ONLY durable, verified facts you confirmed by reading files: build/test/lint commands, ' +
+        'project layout, code conventions you actually observed, entry points. Keep it under 40 lines. ' +
+        'If AGENTS.md already exists, merge-preserving accurate human edits and fixing stale commands.',
+        channelId,
+        channelType,
+      );
+      return true;
+    }
+
+    if (rawArgs === 'diff') {
+      const cwd = agent.capabilities.getCwd();
+      try {
+        const { runGit } = await import('../../capabilities/git/git-path.js');
+        const diff = await runGit('git', ['--no-pager', 'diff', '--no-color', 'HEAD'], { cwd, timeoutMs: 30000 });
+        const trimmedDiff = diff.length > 20000 ? diff.slice(-20000) : diff;
+        if (!trimmedDiff.trim()) {
+          await channel.send('Working tree is clean — no unstaged/staged changes vs HEAD.', channelId);
+        } else {
+          await channel.send('```\n' + trimmedDiff + '\n```', channelId);
+        }
+      } catch (err: any) {
+        await channel.send(`git diff failed: ${err?.message || String(err)}`, channelId);
+      }
+      return true;
+    }
+
+    await channel.send('Unknown /code command. Available: /code, /code plan, /code execute, /code build, /code init, /code diff, /code expand, /code workspace, /code agent <task>, /code off, /code toggle, /code exit', channelId);
+    return true;
+  }
+
+  if (cmd === '/server' || cmd.startsWith('/server ')) {
+    // Remote access is managed on the computer Mercury runs on: the terminal
+    // here, or Mercury Desktop / an attached terminal on this computer —
+    // never from a phone chat or a remote device.
+    const here = channelType === 'cli' || agent.currentMessage?.metadata?.thisComputer === true;
+    if (!here) {
+      await channel.send('`/server` works only on the computer Mercury runs on (its terminal, or Mercury Desktop there).', channelId);
+      return true;
+    }
+    const { runServerCommand } = await import('../../security/server-menu.js');
+    const { localServerOps } = await import('../../security/server-ops.js');
+    const ops = localServerOps({ cloudConnected: () => !!ctx.config().cloud?.enabled, by: channelType === 'cli' ? 'cli' : 'desktop' });
+    const args = trimmed.slice('/server'.length);
+    const prompt = channel as typeof channel & { presentChoicePrompt?: (q: string, o: Array<{ value: string; label: string }>, t?: string) => Promise<string> };
+    const say = async (text: string) => { await channel.send(text, channelId); };
+    if (channel instanceof CLIChannel) {
+      await channel.withMenu(async (select) => {
+        await runServerCommand(args, ops, {
+          choose: async (title, options) => (await select(title, options)) || null,
+          say,
+          // Shown in the menu, not the transcript.
+          secret: async (text) => { await select(text, [{ value: 'ok', label: "I've copied it" }]); },
+        });
+      });
+      return true;
+    }
+    await runServerCommand(args, ops, {
+      choose: async (title, options) => (typeof prompt.presentChoicePrompt === 'function' ? (await prompt.presentChoicePrompt(title, options, channelId)) || null : null),
+      say,
+      secret: async (text) => {
+        if (typeof prompt.presentChoicePrompt === 'function') await prompt.presentChoicePrompt(text, [{ value: 'ok', label: "I've copied it" }], channelId);
+        else await say(text);
+      },
+    });
+    return true;
+  }
+
+  if (cmd.startsWith('/research')) {
+    const rawArgs = trimmed.slice('/research'.length).trim();
+    const sub = rawArgs.toLowerCase();
+    const web = channel instanceof WebChannel ? channel : null;
+    // Research a message as a real user turn in this chat: the same session
+    // as the command (without it the turn, and its report, went to another one).
+    const asked = agent.currentMessage?.channelId === channelId ? agent.currentMessage : null;
+    const research = (content: string, opts: { topic?: string; planFirst?: boolean } = {}): void => {
+      agent.researchMode.setOn(opts.topic ?? content.slice(0, 160), { sessionId: channelId, planFirst: opts.planFirst });
+      web?.sendResearchArmed(true, channelId, { topic: opts.topic ?? content.slice(0, 160), planFirst: opts.planFirst });
+      agent.enqueueMessage({
+        id: `research-${Date.now().toString(36)}`,
+        channelId,
+        channelType: channelType as ChannelType,
+        senderId: 'user',
+        senderName: 'You',
+        content,
+        timestamp: Date.now(),
+        ...(asked?.sessionId ? { sessionId: asked.sessionId } : {}),
+        ...(asked?.metadata ? { metadata: { ...asked.metadata } } : {}),
+      });
+    };
+
+    if (!rawArgs || sub === 'status') {
+      await channel.send(agent.researchMode.getStatusText(), channelId);
+      return true;
+    }
+
+    if (sub === 'on' || sub === 'plan') {
+      agent.researchMode.setOn(undefined, { sessionId: channelId, planFirst: sub === 'plan' });
+      web?.sendResearchArmed(true, channelId, { planFirst: sub === 'plan' });
+      await channel.send(`Research: **On** for your next message here${sub === 'plan' ? ' (plan first)' : ''}. I'll search live sources, cross-check them and write a full report; then research switches off again. \`/research off\` cancels.`, channelId);
+      return true;
+    }
+
+    if (sub === 'off') {
+      agent.researchMode.setOff();
+      web?.sendResearchArmed(false, channelId);
+      await channel.send('Research: **Off**. Back to normal conversation.', channelId);
+      return true;
+    }
+
+    if (sub === 'toggle') {
+      const on = !agent.researchMode.armedForSession(channelId);
+      if (on) agent.researchMode.setOn(undefined, { sessionId: channelId });
+      else agent.researchMode.setOff();
+      web?.sendResearchArmed(on, channelId);
+      await channel.send(`Research: **${on ? 'On' : 'Off'}**${on ? ' for your next message here' : ''}`, channelId);
+      return true;
+    }
+
+    // Pick up where the last run in this chat left off.
+    if (sub === 'continue' || sub === 'retry') {
+      const last = agent.researchMode.runFor(channelId);
+      if (!last) {
+        await channel.send('There is no earlier research in this chat to continue. Use `/research <topic>` to start one.', channelId);
+        return true;
+      }
+      const snap = last.snapshot();
+      if (sub === 'retry') {
+        const failed = last.failedSources().slice(0, 12);
+        if (!failed.length) {
+          await channel.send('Every source in the last research was read; there is nothing to retry.', channelId);
+          return true;
+        }
+        research(`Retry the sources that couldn't be read in the research on "${snap.topic}", then update the report with anything new. Try each once more; if one fails again, find another source for the same point.\n${failed.map((f) => `- ${f.url} (${f.reason ?? 'failed'})`).join('\n')}`, { topic: snap.topic });
+        return true;
+      }
+      const gaps = [
+        ...(snap.cut ? [`it stopped early because ${snap.cut}`] : []),
+        ...last.failedSources().slice(0, 8).map((f) => `${f.domain} couldn't be read (${f.reason ?? 'failed'})`),
+      ];
+      research(`Continue the research on "${snap.topic}". Build on the report already in this conversation: keep what it established, fill in what it doesn't cover, and write the full updated report.${gaps.length ? `\nKnown gaps:\n${gaps.map((g) => `- ${g}`).join('\n')}` : ''}`, { topic: snap.topic });
+      return true;
+    }
+
+    // "/research plan <topic>": show the plan before starting.
+    const planned = /^plan\s+(.+)$/is.exec(rawArgs);
+    if (planned) {
+      research(planned[1].trim(), { planFirst: true });
+      return true;
+    }
+
+    // Anything else is the topic: research it now.
+    if (!web) await channel.send(`Research: **On**\nTopic: ${rawArgs}\nI'll gather live sources and write a full report.`, channelId);
+    research(rawArgs);
+    return true;
+  }
+
+  if (cmd.startsWith('/ws') || cmd.startsWith('/workspace')) {
+    const cliChannel = channelType === 'cli' && channel instanceof CLIChannel ? channel : null;
+    if (!cliChannel) {
+      await channel.send('Workspace IDE mode is currently available in CLI only.', channelId);
+      return true;
+    }
+
+    const base = cmd.startsWith('/workspace') ? '/workspace' : '/ws';
+    const rawArgs = trimmed.slice(base.length).trim();
+    const rawLower = rawArgs.toLowerCase();
+
+    if (!rawArgs || rawLower === 'status') {
+      const ws = cliChannel.getWorkspace();
+      await channel.send(ws?.active ? `Workspace active: ${ws.rootPath}` : 'No active workspace. Use `/ws open <path>`.', channelId);
+      return true;
+    }
+
+    if (rawLower.startsWith('open ')) {
+      const target = rawArgs.slice(5).trim();
+      const opened = cliChannel.openWorkspace(target);
+      if (opened.ok) {
+        agent.capabilities.setCwd(path.resolve(target.replace(/^~(?=$|\/)/, process.env.HOME || '~')));
+        agent.capabilities.permissions.addTempScope(agent.capabilities.getCwd(), true, true);
+        agent.programmingMode.setExecute();
+        agent.programmingMode.setProjectContext(agent.capabilities.getCwd());
+        cliChannel.setProgrammingStatus(agent.programmingMode.getState(), agent.programmingMode.getProjectContext());
+        await channel.send(`${opened.message}\nWorkspace IDE is ready.`, channelId);
+      } else {
+        await channel.send(opened.message, channelId);
+      }
+      return true;
+    }
+
+    if (rawLower === 'refresh') {
+      cliChannel.refreshWorkspace();
+      await channel.send('Workspace refreshed.', channelId);
+      return true;
+    }
+
+    if (rawLower.startsWith('stage ')) {
+      const fileArg = rawArgs.slice(6).trim();
+      const result = cliChannel.stageWorkspaceFile(fileArg || 'all');
+      await channel.send(result.message, channelId);
+      return true;
+    }
+
+    if (rawLower.startsWith('commit ')) {
+      const message = rawArgs.slice(7).trim();
+      const result = cliChannel.commitWorkspace(message);
+      await channel.send(result.message, channelId);
+      return true;
+    }
+
+    if (rawLower.startsWith('undo ')) {
+      const fileArg = rawArgs.slice(5).trim();
+      const result = cliChannel.undoWorkspaceFile(fileArg);
+      await channel.send(result.message, channelId);
+      return true;
+    }
+
+    if (rawLower === 'help') {
+      await channel.send('Workspace commands:\n`/ws open <path>`\n`/ws refresh`\n`/ws stage <file|all>`\n`/ws commit <message>`\n`/ws undo <file>`\n`/ws status`', channelId);
+      return true;
+    }
+
+    await channel.send('Unknown workspace command. Use `/ws help`.', channelId);
+    return true;
+  }
+
+  if (cmd.startsWith('/spotify')) {
+    if (!agent.spotifyClient) {
+      await channel.send('Spotify is not connected. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in your config, then run /spotify auth.', channelId);
+      return true;
+    }
+    const rawArgs = trimmed.slice('/spotify'.length).trim().toLowerCase();
+
+    if (!rawArgs || rawArgs === 'status') {
+      const auth = agent.spotifyClient.isAuthenticated() ? 'Connected' : 'Not connected';
+      const device = agent.spotifyClient.getDeviceId() || 'none';
+
+      let accountName = agent.spotifyClient.getAccountName();
+      let accountId = agent.spotifyClient.getAccountId();
+      let product = agent.spotifyClient.getProduct();
+      let accountError = '';
+
+      if (!accountName) {
+        try {
+          await agent.spotifyClient.saveAccountInfo();
+          accountName = agent.spotifyClient.getAccountName();
+          accountId = agent.spotifyClient.getAccountId();
+          product = agent.spotifyClient.getProduct();
+        } catch (err: any) {
+          accountError = err.message;
+          logger.warn({ err: err.message }, 'Failed to fetch Spotify account info');
+        }
+      }
+
+      let premium = agent.spotifyClient.getPremiumStatus();
+      if (premium === null) {
+        premium = await agent.spotifyClient.checkPremium();
+      }
+
+      let status = `Spotify: **${auth}**`;
+      if (accountName) status += `\nAccount: **${accountName}**`;
+      if (accountId) status += `\nUser ID: ${accountId}`;
+      if (product) status += `\nPlan: ${product}`;
+      if (premium === true) {
+        status += ' — all features available';
+      } else if (premium === false) {
+        status += ' — playback control requires Premium';
+      }
+      if (accountError) status += `\n⚠ Could not verify account: ${accountError}`;
+      status += `\nDevice: ${device !== 'none' ? device : 'none selected'}`;
+      await channel.send(status, channelId);
+      return true;
+    }
+
+    if (rawArgs === 'auth') {
+      if (channelType === 'cli' && channel instanceof CLIChannel) {
+        try {
+          const choice = await channel.withMenu(async (select) => {
+            return select('Spotify Authorization', [
+              { value: 'browser', label: 'Open browser (recommended)' },
+              { value: 'manual', label: 'Paste authorization code manually' },
+              { value: 'cancel', label: 'Cancel' },
+            ]);
+          });
+          if (!choice || choice === 'cancel') {
+            await channel.send('Spotify auth cancelled.', channelId);
+            return true;
+          }
+          if (choice === 'manual') {
+            const authUrl = agent.spotifyClient.getAuthUrl();
+            await channel.send('1. Open this URL in your browser:\n' + authUrl + '\n\n2. After authorizing, you will be redirected to localhost — it may show an error page, that is OK.\n3. Copy the `code` parameter from the URL in your browser address bar.\n4. Paste it below:', channelId);
+            const code = await channel.prompt('Authorization code: ');
+            if (!code || !code.trim()) {
+              await channel.send('No code provided. Auth cancelled.', channelId);
+              return true;
+            }
+            await agent.spotifyClient.authenticateWithCode(code.trim());
+            await channel.send('Spotify connected successfully! Try: play some music', channelId);
+          } else {
+            await channel.send(`Opening browser for Spotify authorization...\nIf it doesn't open, visit ${agent.spotifyClient.getLocalLoginUrl()}`, channelId);
+            await agent.spotifyClient.authenticate();
+            await channel.send('Spotify connected successfully! Try: play some music', channelId);
+          }
+        } catch (err: any) {
+          await channel.send(`Spotify auth failed: ${err.message}`, channelId);
+        }
+      } else {
+        const authUrl = agent.spotifyClient.getAuthUrl();
+        await channel.send(
+          '**Connect Spotify**\n\n1. Open this URL on any device with a browser:\n' + authUrl + '\n\n2. After authorizing, you will be redirected to localhost — that page may show an error, that is OK.\n3. Copy the `code` from the URL, then type:\n`/spotify code <paste-code-here>`',
+          channelId
+        );
+      }
+      return true;
+    }
+
+    if (rawArgs.startsWith('code ')) {
+      const code = rawArgs.slice('code '.length).trim();
+      if (!code) {
+        await channel.send('Usage: /spotify code <authorization-code>', channelId);
+        return true;
+      }
+      try {
+        await agent.spotifyClient.authenticateWithCode(code);
+        await channel.send('Spotify connected successfully! Try: play some music', channelId);
+      } catch (err: any) {
+        await channel.send(`Spotify auth failed: ${err.message}`, channelId);
+      }
+      return true;
+    }
+
+    if (rawArgs === 'devices') {
+      try {
+        const data = await agent.spotifyClient.getDevices();
+        if (!data?.devices?.length) { await channel.send('No active devices. Open Spotify on a device first.', channelId); return true; }
+        const lines = ['**Spotify Devices:**\n'];
+        for (const d of data.devices) {
+          lines.push(`${d.is_active ? '▶' : '○'} **${d.name}** (${d.type}) — \`${d.id}\`${d.is_active ? ' [active]' : ''}`);
+        }
+        await channel.send(lines.join('\n'), channelId);
+      } catch (err: any) { await channel.send(`Failed: ${err.message}`, channelId); }
+      return true;
+    }
+
+    if (rawArgs.startsWith('device ')) {
+      const id = rawArgs.slice('device '.length).trim();
+      agent.spotifyClient.setDevice(id);
+      await channel.send(`Active device set to: ${id}`, channelId);
+      return true;
+    }
+
+    if (rawArgs === 'player' && channelType === 'cli' && channel instanceof CLIChannel) {
+      await channel.withMenu(async (select) => {
+        while (true) {
+          try {
+            const np = await agent.spotifyClient!.getCurrentlyPlaying();
+            if (np) {
+              await channel.send(formatNowPlaying(np), channelId);
+            }
+          } catch {}
+          const action = await select('Spotify Player', PLAYER_CONTROLS);
+          if (action === 'exit' || !action) return;
+          if (action === 'search') {
+            const query = await channel.prompt('Search: ');
+            if (!query) continue;
+            try {
+              const results = await agent.spotifyClient!.search(query, 'track', 5);
+              const tracks = results?.tracks?.items || [];
+              if (tracks.length === 0) { await channel.send('No results found.', channelId); continue; }
+              const trackOptions = tracks.map((t: any, i: number) => ({
+                value: t.uri,
+                label: `${t.artists?.map((a: any) => a.name).join(', ')} — ${t.name}`,
+              }));
+              const picked = await select('Play which track?', [...trackOptions, { value: 'back', label: 'Back' }]);
+              if (picked && picked !== 'back') {
+                await agent.spotifyClient!.play([picked]);
+              }
+            } catch (err: any) { await channel.send(`Search failed: ${err.message}`, channelId); }
+            continue;
+          }
+          if (action === 'volume') {
+            const vol = await channel.prompt('Volume (0-100): ');
+            const n = parseInt(vol, 10);
+            if (!isNaN(n) && n >= 0 && n <= 100) {
+              await agent.spotifyClient!.setVolume(n);
+              await channel.send(`Volume: ${n}%`, channelId);
+            }
+            continue;
+          }
+          if (action === 'queue') {
+            const query = await channel.prompt('Search track to queue: ');
+            if (!query) continue;
+            try {
+              const results = await agent.spotifyClient!.search(query, 'track', 5);
+              const tracks = results?.tracks?.items || [];
+              if (tracks.length === 0) { await channel.send('No results.', channelId); continue; }
+              const trackOptions = tracks.map((t: any) => ({
+                value: t.uri,
+                label: `${t.artists?.map((a: any) => a.name).join(', ')} — ${t.name}`,
+              }));
+              const picked = await select('Queue which track?', [...trackOptions, { value: 'back', label: 'Back' }]);
+              if (picked && picked !== 'back') {
+                await agent.spotifyClient!.addToQueue(picked);
+                await channel.send('Added to queue.', channelId);
+              }
+            } catch (err: any) { await channel.send(`Failed: ${err.message}`, channelId); }
+            continue;
+          }
+          try {
+            const result = await handlePlayerAction(action, agent.spotifyClient!);
+            await channel.send(result, channelId);
+          } catch (err: any) {
+            await channel.send(`Failed: ${err.message}`, channelId);
+          }
+        }
+      });
+      return true;
+    }
+
+    if (rawArgs === 'now' || rawArgs === 'playing' || rawArgs === 'np') {
+      try {
+        const text = await agent.spotifyClient.getNowPlayingText();
+        await channel.send(text, channelId);
+      } catch (err: any) { await channel.send(`Failed: ${err.message}`, channelId); }
+      return true;
+    }
+
+    if (rawArgs === 'logout') {
+      agent.spotifyClient.logout();
+      await channel.send('Spotify disconnected. Run `/spotify auth` to reconnect.', channelId);
+      return true;
+    }
+
+    await channel.send('Unknown /spotify command. Available: /spotify, /spotify auth, /spotify code <code>, /spotify logout, /spotify player, /spotify devices, /spotify device <id>, /spotify now', channelId);
+    return true;
+  }
+
+  if (cmd === '/stream on') {
+    agent.telegramStreaming = true;
+    await channel.send('Telegram streaming enabled. Responses will appear progressively.', channelId);
+    return true;
+  }
+
+  if (cmd === '/stream off') {
+    agent.telegramStreaming = false;
+    await channel.send('Telegram streaming disabled. Responses will arrive as a single message.', channelId);
+    return true;
+  }
+
+  if (cmd === '/stream') {
+    agent.telegramStreaming = !agent.telegramStreaming;
+    await channel.send(
+      agent.telegramStreaming
+        ? 'Telegram streaming enabled. Responses will appear progressively.'
+        : 'Telegram streaming disabled. Responses will arrive as a single message.',
+      channelId,
+    );
+    return true;
+  }
+  if (cmd === '/stream off') {
+    agent.telegramStreaming = false;
+    await channel.send('Telegram streaming disabled. Responses will arrive as a single message.', channelId);
+    return true;
+  }
+
+  if (cmd.startsWith('/agents')) {
+    if (!agent.supervisor) {
+      await channel.send('Sub-agents are not available.', channelId);
+      return true;
+    }
+    const rawArgs = trimmed.slice('/agents'.length).trim();
+
+    if (!rawArgs) {
+      const agents = agent.supervisor.getActiveAgents();
+      const resourceInfo = agent.supervisor.getResourceUsage();
+      if (agents.length === 0) {
+        await channel.send(`No active sub-agents.\nMax concurrent: ${resourceInfo.maxConcurrentAgents} (auto) | CPU: ${resourceInfo.cpuCores} cores`, channelId);
+        return true;
+      }
+      const statusIcons: Record<string, string> = { pending: '🔵', running: '🟢', paused: '🟡', completed: '✅', failed: '❌', halted: '⛔' };
+      const lines = [`**Sub-Agents** (${agents.length})`, ''];
+      for (const agent of agents) {
+        const icon = statusIcons[agent.status] || '❓';
+        const taskPreview = agent.task.length > 40 ? agent.task.slice(0, 40) + '...' : agent.task;
+        lines.push(`${icon} **${agent.id}**  ${taskPreview}`);
+        if (agent.progress) lines.push(`   ${agent.progress}`);
+      }
+      lines.push('');
+      lines.push(`Max concurrent: ${resourceInfo.maxConcurrentAgents} (auto) | CPU: ${resourceInfo.cpuCores} cores`);
+      lines.push(`Active: ${resourceInfo.activeAgents} | Queued: ${resourceInfo.queuedAgents}`);
+      await channel.send(lines.join('\n'), channelId);
+      return true;
+    }
+
+    const parts = rawArgs.split(/\s+/);
+    const action = parts[0]?.toLowerCase();
+
+    if (action === 'stop') {
+      const target = parts[1]?.toLowerCase();
+      if (!target) {
+        await channel.send('Usage: /agents stop <id> or /agents stop all', channelId);
+        return true;
+      }
+      if (target === 'all') {
+        await agent.supervisor.haltAll();
+        await channel.send('All sub-agents halted. They will finish their current tool step before stopping.', channelId);
+      } else {
+        const halted = await agent.supervisor.halt(target);
+        if (!halted) {
+          await channel.send(`No active agent found with ID "${target}".`, channelId);
+        } else {
+          await channel.send(`Agent ${target} halt signal sent. It will finish its current step then stop.`, channelId);
+        }
+      }
+      return true;
+    }
+
+    if (action === 'pause') {
+      const target = parts[1]?.toLowerCase();
+      if (!target) {
+        await channel.send('Usage: /agents pause <id>', channelId);
+        return true;
+      }
+      const paused = await agent.supervisor.pause(target);
+      await channel.send(paused ? `Agent ${target} paused. Use /agents resume ${target} to continue.` : `No running agent found with ID "${target}".`, channelId);
+      return true;
+    }
+
+    if (action === 'resume') {
+      const target = parts[1]?.toLowerCase();
+      if (!target) {
+        await channel.send('Usage: /agents resume <id>', channelId);
+        return true;
+      }
+      const resumed = await agent.supervisor.resume(target);
+      await channel.send(resumed ? `Agent ${target} resumed.` : `No paused agent found with ID "${target}".`, channelId);
+      return true;
+    }
+
+    if (action === 'config') {
+      const info = agent.supervisor.getResourceUsage();
+      const lines = [
+        '**Sub-Agent Configuration**',
+        `CPU cores: ${info.cpuCores}`,
+        `System RAM: ${info.systemMemoryMB}MB`,
+        `Available RAM: ${info.availableMemoryMB}MB`,
+        `Max concurrent: ${info.maxConcurrentAgents}`,
+        `Active agents: ${info.activeAgents}`,
+        `Queued agents: ${info.queuedAgents}`,
+        `Token budget remaining: ${info.tokenBudgetRemaining.toLocaleString()}`,
+      ];
+      await channel.send(lines.join('\n'), channelId);
+      return true;
+    }
+
+    if (action === 'set' && parts[1]?.toLowerCase() === 'max') {
+      const n = parseInt(parts[2], 10);
+      if (isNaN(n) || n < 1) {
+        await channel.send('Usage: /agents set max <number>', channelId);
+        return true;
+      }
+      agent.supervisor.setMaxConcurrent(n);
+      await channel.send(`Max concurrent sub-agents set to ${n}.`, channelId);
+      return true;
+    }
+
+    await channel.send(`Unknown /agents command "${action}". Available: /agents, /agents stop <id|all>, /agents pause <id>, /agents resume <id>, /agents config, /agents set max <n>`, channelId);
+    return true;
+  }
+
+  // Here this chat was idle (the command is its own turn). Other chats may be
+  // running (ADR-037): /halt stops them all, /stop only what this chat started
+  // — a full stop (locks released, task board cleared) when nothing else runs.
+  if (cmd === '/halt') {
+    await channel.send(await agent.stopAllWork('halted'), channelId);
+    return true;
+  }
+
+  if (cmd === '/stop') {
+    await channel.send(await agent.stopAllWork('stopped', { channelId }), channelId);
+    return true;
+  }
+
+  if (cmd === '/reset') {
+    if (channelType === 'cli' && channel instanceof CLIChannel) {
+      const confirmed = await channel.askToContinue(
+        '⚠ /reset will halt ALL agents, clear queues, release locks, clear task board, and wipe conversation context. Continue? (y/n)',
+        channelId,
+      ).catch(() => false);
+      if (!confirmed) {
+        await channel.send('Reset cancelled.', channelId);
+        return true;
+      }
+    }
+    if (agent.supervisor) {
+      await agent.supervisor.haltAll();
+      agent.supervisor.clearTaskBoard();
+    }
+    agent.shortTerm.clearAll();
+    agent.lifecycle.transition('idle');
+    await channel.send('Mercury reset. All agents stopped, all state cleared. Long-term memory preserved. Ready for a fresh start.', channelId);
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * /effort (issue #188): how hard the current model thinks in this chat.
+ *   /effort                 what applies here, and the levels this model takes
+ *   /effort <level>         this chat only
+ *   /effort default         this chat back to the model's default
+ *   /effort global <level>  the model's default (every chat without its own)
+ */
+export async function effortCommand(agent: Agent, arg: string): Promise<string> {
+  const current = agent.providers.getDefault();
+  const provider = current.name;
+  const model = current.getModel();
+  const pc = (agent.config.providers as unknown as Record<string, import('../../utils/config.js').ProviderConfig | undefined>)[provider];
+  // An OpenAI-compatible server may say which models take an effort.
+  if (pc) await discoverReasoningCaps({ ...pc, model }, model).catch(() => undefined);
+  const chatKey = (agent as { currentChatKey?: () => string | undefined }).currentChatKey?.();
+  const name = displayModelName(provider, model);
+  const state = effortFor(provider, model, chatKey);
+  if (!state.levels.length) {
+    return `${name} has no effort setting Mercury can apply — it decides how much to think on its own.`;
+  }
+  const choices = ['auto', ...state.levels];
+  const usage = 'Use `/effort <level>` for this chat, `/effort default` to go back to the model\'s default, `/effort global <level>` to change that default.';
+  const [verb, value] = arg.split(/\s+/, 2);
+
+  if (!arg) {
+    const applied = effortLabel(state.effective ?? 'auto');
+    const why = state.source === 'chat' ? 'set for this chat'
+      : state.source === 'model' ? 'this model\'s default'
+      : 'the model decides';
+    return [
+      `**Effort** · ${name}: **${applied}** (${why})`,
+      `Model default: ${effortLabel(state.modelDefault)}${state.chat ? ` · This chat: ${effortLabel(state.chat)}` : ''}`,
+      ...(state.chatUnsupported ? [`This chat asked for ${effortLabel(state.chat!)}, which ${name} doesn't take, so its default applies.`] : []),
+      `Levels: ${choices.join(' · ')}`,
+      usage,
+    ].join('\n');
+  }
+  if (verb === 'default' || verb === 'reset' || verb === 'clear') {
+    if (chatKey) setChatEffort(chatKey, null);
+    return `This chat now uses ${name}'s default: **${effortLabel(state.modelDefault)}**.`;
+  }
+  if (verb === 'global') {
+    if (!value || !choices.includes(value)) return `\`/effort global <level>\` — ${name} takes: ${choices.join(', ')}.`;
+    setModelPref(provider, model, { reasoning: value === 'auto' ? null : (value as ReasoningLevel) });
+    return `Default effort for ${name}: **${effortLabel(value)}**${state.chat ? ` (this chat keeps its own: ${effortLabel(state.chat)})` : ''}.`;
+  }
+  if (!choices.includes(verb)) return `${name} takes: ${choices.join(', ')}. ${usage}`;
+  if (!chatKey) {
+    setModelPref(provider, model, { reasoning: verb === 'auto' ? null : (verb as ReasoningLevel) });
+    return `Default effort for ${name}: **${effortLabel(verb)}**.`;
+  }
+  setChatEffort(chatKey, verb as ReasoningLevel | 'auto');
+  return `Effort for this chat: **${effortLabel(verb)}** (${name}). Applies from the next message; \`/effort default\` goes back to ${effortLabel(state.modelDefault)}.`;
+}
+
+/** "Effort: High (this chat)" for /status (#188: the effective setting and where it comes from). */
+function effortStatusLine(agent: Agent): string {
+  try {
+    const current = agent.providers.getDefault();
+    const chatKey = (agent as { currentChatKey?: () => string | undefined }).currentChatKey?.();
+    const state = effortFor(current.name, current.getModel(), chatKey);
+    if (!state.levels.length) return 'Effort: not adjustable for this model';
+    const where = state.source === 'chat' ? 'this chat' : state.source === 'model' ? 'model default' : 'model decides';
+    return `Effort: ${effortLabel(state.effective ?? 'auto')} (${where})`;
+  } catch {
+    return 'Effort: —';
+  }
+}
+
+/**
+ * /media (ADR-042): which model makes images, and choosing it.
+ *   /media                 the image model in use and the ones available
+ *   /media image <n|ref|auto>  set the default (a number from the list, "provider::model", or auto)
+ *   /media refresh         ask the providers again
+ *   /image                 (no prompt) the same overview; /image <prompt> makes one
+ */
+export async function mediaCommand(media: MediaService, arg: string, speech: SpeechService | null = null): Promise<{ text: string; pick?: MediaModel[] }> {
+  const [verb, ...rest] = arg.split(/\s+/).filter(Boolean);
+  if (speech && (verb === 'speech' || verb === 'voice' || verb === 'replies')) {
+    return { text: await speechVerb(speech, verb, rest.join(' ').trim()) };
+  }
+  if (verb === 'video' || verb === 'videos' || verb === 'music' || verb === 'song') {
+    return { text: await jobKindVerb(media, verb.startsWith('video') ? 'video' : 'music', rest.join(' ').trim()) };
+  }
+  if (verb === 'jobs') return { text: jobsSummary() };
+  const refresh = verb === 'refresh';
+  const setup = await media.imageSetup({ refresh });
+  const list = setup.models;
+  const numbered = list.slice(0, 30);
+  if (verb === 'image' || verb === 'images') {
+    const value = rest.join(' ').trim();
+    if (!value) return { text: 'Usage: `/media image <number|provider::model|auto>` — see `/media` for the list.' };
+    if (/^(auto|automatic|default|clear)$/i.test(value)) {
+      setMediaDefault('image', null);
+      return { text: `Images now use the best model available automatically${setup.auto ? ` (now: **${setup.auto.label}** · ${setup.auto.group})` : ''}.` };
+    }
+    const byNumber = /^\d+$/.test(value) ? numbered[Number(value) - 1] : undefined;
+    const chosen = byNumber ?? list.find((m) => m.ref === value || m.model === value);
+    if (!chosen) return { text: `No image model "${value}". Use a number from \`/media\`, or provider::model.` };
+    setMediaDefault('image', chosen.ref);
+    return { text: `Images now use **${chosen.label}** · ${chosen.group}.` };
+  }
+  if (!list.length) {
+    return {
+      text: [
+        '**Images** · no image model found on your providers.',
+        'Image models come from providers that serve them: OpenAI (gpt-image), OpenRouter (Gemini image, FLUX, …), LiteLLM, AI/ML API, Atlas Cloud, Runcrate, Mercury Cloud, or an Ollama image model.',
+        'Add one with `mercury doctor` (or Mercury Desktop → Settings → AI), then `/media refresh`.',
+      ].join('\n'),
+    };
+  }
+  const inUse = setup.default?.available
+    ? list.find((m) => m.ref === setup.default!.ref)
+    : setup.auto;
+  const lines = [
+    `**Images** · ${inUse ? `${inUse.label} · ${inUse.group}` : 'none'} (${setup.default?.available ? 'your default' : 'automatic'})`,
+    ...(setup.default && !setup.default.available ? [`Your default (${setup.default.ref}) isn't offered right now, so the automatic pick is used.`] : []),
+    '',
+    ...numbered.map((m, i) => `${i + 1}. ${m.label} · ${m.group}${m.canEdit ? '' : ' (no edits)'}${inUse?.ref === m.ref ? ' ← in use' : ''}${unusableReason(m.ref) ? ` (skipped: ${unusableReason(m.ref)})` : ''}`),
+    ...(list.length > numbered.length ? [`…and ${list.length - numbered.length} more`] : []),
+    '',
+    'Make one: `/image <what to draw>` (add `--landscape` or `--portrait`). Change the default: `/media image <number>` or `/media image auto`.',
+    ...(speech ? ['', await speechSummary(speech)] : []),
+    '',
+    await jobKindSummary(media, 'video'),
+    '',
+    await jobKindSummary(media, 'music'),
+  ];
+  return { text: lines.join('\n'), pick: numbered };
+}
+
+const REPLY_LABEL = { off: 'never', mirror: 'when you send a voice note', always: 'on every reply' } as const;
+
+/** The Speech part of /media. */
+async function speechSummary(speech: SpeechService): Promise<string> {
+  const [target, options] = await Promise.all([speech.target(), speech.options()]);
+  const prefs = speech.prefs();
+  const replies = prefs.replies ?? 'mirror';
+  if (!target) {
+    return '**Speech** · no speech service. Add an OpenAI key (Settings → Models) or a Gemini, Deepgram or ElevenLabs key (Settings → Voice).';
+  }
+  return [
+    `**Speech** · ${target.label}${target.voice ? ` · voice ${target.voice}` : ''} (${prefs.choice ? 'your choice' : 'from Settings → Voice'})`,
+    ...options.slice(0, 20).map((o, i) => `${i + 1}. ${o.label} · ${o.group}${o.id === target.id ? ' ← in use' : ''}`),
+    `Voice-note replies in chat apps: ${REPLY_LABEL[replies]}.`,
+    'Say something: `/say <text>`. Change: `/media speech <number|auto>`, `/media voice <name>`, `/media replies off|mirror|always`.',
+  ].join('\n');
+}
+
+async function speechVerb(speech: SpeechService, verb: string, value: string): Promise<string> {
+  try {
+    if (verb === 'replies') {
+      if (!['off', 'mirror', 'always'].includes(value)) return 'Usage: `/media replies off|mirror|always` — mirror answers a voice note with a voice note.';
+      setSpeechPrefs({ replies: value as 'off' | 'mirror' | 'always' });
+      return `Voice-note replies: ${REPLY_LABEL[value as keyof typeof REPLY_LABEL]}.`;
+    }
+    if (verb === 'voice') {
+      if (!value) {
+        const target = await speech.target();
+        const option = (await speech.options()).find((o) => o.id === target?.id);
+        return `Voice: ${target?.voice ?? 'the service default'}.${option?.voices.length ? ` Voices: ${option.voices.join(', ')}.` : ''} Use \`/media voice <name>\` or \`/media voice default\`.`;
+      }
+      setSpeechPrefs({ voice: /^(default|auto|clear)$/i.test(value) ? null : value });
+      return /^(default|auto|clear)$/i.test(value) ? "Voice: the service's default." : `Voice: **${value}**.`;
+    }
+    if (!value) return 'Usage: `/media speech <number|auto>` — see `/media` for the list.';
+    if (/^(auto|default|clear)$/i.test(value)) {
+      setSpeechPrefs({ choice: null });
+      const t = await speech.target();
+      return `Speech now follows Settings → Voice${t ? ` (now: **${t.label}**)` : ''}.`;
+    }
+    const options = await speech.options();
+    const chosen = /^\d+$/.test(value) ? options[Number(value) - 1] : options.find((o) => o.id === value || o.label.toLowerCase() === value.toLowerCase());
+    if (!chosen) return `No speech service "${value}". Use a number from \`/media\`.`;
+    setSpeechPrefs({ choice: chosen.id });
+    return `Speech now uses **${chosen.label}** · ${chosen.group}.`;
+  } catch (err) {
+    return `Couldn't change that: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+/** The Video / Music part of /media. */
+async function jobKindSummary(media: MediaService, kind: 'video' | 'music'): Promise<string> {
+  const setup = await media.setup(kind);
+  const title = kind === 'video' ? '**Video**' : '**Music**';
+  if (!setup.models.length) {
+    return `${title} · none found. ${kind === 'video' ? 'A Gemini key (Settings → Voice) gives Gemini Omni video; gateways (LiteLLM, Mercury Cloud) can serve others.' : 'A Gemini key (Lyria) or an ElevenLabs key (Settings → Voice) makes music.'}`;
+  }
+  const inUse = setup.default?.available ? setup.models.find((m) => m.ref === setup.default!.ref) : setup.auto;
+  return [
+    `${title} · ${inUse ? `${inUse.label} · ${inUse.group}` : 'none'} (${setup.default?.available ? 'your default' : 'automatic'})`,
+    ...setup.models.slice(0, 15).map((m, i) => `${i + 1}. ${m.label} · ${m.group}${inUse?.ref === m.ref ? ' ← in use' : ''}${unusableReason(m.ref) ? ` (skipped: ${unusableReason(m.ref)})` : ''}`),
+    kind === 'video'
+      ? 'Make one: `/video <the shot>` (`--portrait`, `--seconds 6`). Change: `/media video <number|auto>`. It arrives here when ready.'
+      : 'Make one: `/music <genre, mood, lyrics>` (`--instrumental`, `--seconds 60`). Change: `/media music <number|auto>`.',
+  ].join('\n');
+}
+
+async function jobKindVerb(media: MediaService, kind: 'video' | 'music', value: string): Promise<string> {
+  if (!value) return jobKindSummary(media, kind);
+  if (/^(auto|automatic|default|clear)$/i.test(value)) {
+    setMediaDefault(kind, null);
+    return `${kind === 'video' ? 'Videos' : 'Music'} now use the best model available automatically.`;
+  }
+  const list = await media.models(kind);
+  const chosen = /^\d+$/.test(value) ? list[Number(value) - 1] : list.find((m) => m.ref === value || m.model === value);
+  if (!chosen) return `No ${kind} model "${value}". Use a number from \`/media ${kind}\`.`;
+  setMediaDefault(kind, chosen.ref);
+  return `${kind === 'video' ? 'Videos' : 'Music'} now use **${chosen.label}** · ${chosen.group}.`;
+}
+
+/** /media jobs: videos and songs being made, and the last few made. */
+function jobsSummary(): string {
+  const list = mediaJobs()?.list(undefined, 10) ?? [];
+  if (!list.length) return 'No videos or songs made yet. `/video <shot>` or `/music <style>` makes one.';
+  const ago = (t: number) => { const s = Math.round((Date.now() - t) / 1000); return s < 90 ? `${s}s ago` : s < 5400 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`; };
+  return ['**Media jobs**', ...list.map((j) => `• ${j.kind === 'video' ? '🎬' : '🎵'} ${j.prompt.slice(0, 60)}${j.prompt.length > 60 ? '…' : ''} — ${j.status === 'running' ? `making (started ${ago(j.createdAt)})` : j.status === 'done' ? `ready ${ago(j.finishedAt ?? j.createdAt)}` : `failed: ${(j.error ?? '').slice(0, 80)}`}`)].join('\n');
+}
+

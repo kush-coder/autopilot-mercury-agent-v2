@@ -1,0 +1,1225 @@
+/* ═══════════════════════════════════════════════════════════════
+   Mercury API Client — Typed fetch layer for all endpoints
+   ═══════════════════════════════════════════════════════════════ */
+
+import { apiUrl, authHeaders, handleUnauthorized, handleSignedOut, isRemoteMode } from "./connection";
+
+async function request<T>(
+  path: string,
+  options?: RequestInit
+): Promise<T> {
+  const res = await fetch(apiUrl(path), {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders(),
+      ...options?.headers,
+    },
+  });
+
+  if (res.status === 401) {
+    handleUnauthorized();
+    throw new Error("Unauthorized");
+  }
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(
+      (body as Record<string, string>).error || `Request failed: ${res.status}`
+    );
+  }
+
+  return res.json();
+}
+
+function get<T>(path: string): Promise<T> {
+  return request<T>(path);
+}
+
+function post<T>(path: string, body?: unknown): Promise<T> {
+  return request<T>(path, {
+    method: "POST",
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+function put<T>(path: string, body?: unknown): Promise<T> {
+  return request<T>(path, {
+    method: "PUT",
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+function patch<T>(path: string, body?: unknown): Promise<T> {
+  return request<T>(path, {
+    method: "PATCH",
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+function del<T>(path: string): Promise<T> {
+  return request<T>(path, { method: "DELETE" });
+}
+
+// ── Status ──
+export const status = {
+  get: () => get<AgentStatus>("/api/status"),
+};
+
+// ── Health / contract (see src/web/api-contract.ts in the runtime) ──
+export const health = {
+  get: () => get<HealthInfo>("/api/health"),
+  /** Probe an arbitrary runtime URL with an explicit token; used before a connection is configured. */
+  probe: async (baseUrl: string, token: string | null, timeoutMs = 5000): Promise<HealthInfo> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/api/health`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(res.status === 404 || res.status === 401 ? "Unauthorized" : `Health check failed (${res.status})`);
+      return (await res.json()) as HealthInfo;
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+};
+
+export interface HealthInfo {
+  ok: boolean;
+  pid: number;
+  version: string;
+  apiVersion: number;
+  features: string[];
+  state: string;
+  booting: boolean;
+}
+
+export interface DeviceSummary {
+  id: string;
+  name: string;
+  platform: string;
+  createdAt: string;
+  lastSeenAt: string | null;
+}
+
+export interface PairResponse {
+  token: string;
+  device: DeviceSummary;
+  apiVersion: number;
+  features: string[];
+}
+
+export class PairError extends Error {
+  constructor(message: string, public readonly status: number, public readonly retryAfterSeconds: number | null) {
+    super(message);
+    this.name = "PairError";
+  }
+}
+
+// ── Auth ──
+export const auth = {
+  /** Cookie session for the runtime-served dashboard. */
+  login: (username: string, password: string) =>
+    fetch(apiUrl("/api/auth/login"), {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username, password }),
+      redirect: "manual",
+    }),
+  /**
+   * Device token for a hosted client (Mercury Desktop, phones). Unlike
+   * login() this never touches cookies and the token is the only secret
+   * the client keeps. Pass the runtime URL explicitly: nothing is
+   * configured yet when a connection is being added.
+   */
+  pair: async (baseUrl: string, username: string, password: string, deviceName: string, platform: string) => {
+    const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/api/auth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password, deviceName, platform }),
+    });
+    const body = (await res.json().catch(() => ({}))) as Partial<PairResponse> & { error?: string };
+    if (!res.ok) {
+      const retry = res.headers.get("Retry-After");
+      throw new PairError(body.error || `Pairing failed (${res.status})`, res.status, retry ? Number(retry) : null);
+    }
+    return body as PairResponse;
+  },
+  /** Sign out of whatever we are signed in as, then hand control to the shell (or /login). */
+  signOut: async () => {
+    try {
+      if (isRemoteMode()) {
+        await post<{ success: boolean }>("/api/auth/token/revoke").catch(() => post("/api/auth/logout"));
+      } else {
+        window.location.href = "/api/auth/logout";
+        return;
+      }
+    } finally {
+      if (isRemoteMode()) handleSignedOut();
+    }
+  },
+  devices: () => get<{ devices: DeviceSummary[]; current: string | null }>("/api/auth/devices"),
+  revokeDevice: (id: string) => del<{ success: boolean }>(`/api/auth/devices/${encodeURIComponent(id)}`),
+  logout: () => get<void>("/api/auth/logout"),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    post<{ success: boolean }>("/api/auth/password", {
+      currentPassword,
+      newPassword,
+    }),
+  changeUsername: (currentPassword: string, newUsername: string) =>
+    post<{ success: boolean }>("/api/auth/username", {
+      currentPassword,
+      newUsername,
+    }),
+};
+
+// ── Config ──
+export const config = {
+  get: () => get<AppConfig>("/api/config"),
+  update: (data: Partial<AppConfig>) => put<{ success: boolean; restartRequired?: boolean }>("/api/config", data),
+  /** Apply saved configuration: the runtime reads providers/keys at boot. */
+  restart: () => post<{ ok: boolean; message: string }>("/api/restart"),
+};
+
+// ── Providers ──
+export const providers = {
+  list: () => get<ProviderInfo[]>("/api/providers"),
+  update: (name: string, data: ProviderUpdate) =>
+    post<{ success: boolean }>(`/api/providers/${name}`, data),
+  test: (name: string) =>
+    post<ProviderTestResult>(`/api/providers/${name}/test`),
+};
+
+// ── Chat ──
+export const chat = {
+  send: (content: string, threadId?: string, attachments?: InlineChatAttachment[]) =>
+    post<{ sent: boolean; sessionId: string; attachments?: ChatAttachment[] }>("/api/chat/send", { content, sessionId: threadId, attachments }),
+  settings: {
+    get: () => get<ChatSettings>("/api/chat/settings"),
+    update: (data: Partial<ChatSettings>) =>
+      put<ChatSettings>("/api/chat/settings", data),
+  },
+  permission: (id: string, action: string, targetId?: string) =>
+    post<{ resolved: boolean }>(`/api/chat/permission/${id}`, { action, targetId }),
+  models: {
+    list: () => get<ModelsResponse>("/api/chat/models"),
+    switch: (provider: string, model?: string) =>
+      post<{ ok: boolean; message: string }>("/api/chat/models/switch", {
+        provider,
+        model,
+      }),
+    /** Rename a model and/or set its reasoning level; null / '' / 'auto' resets. */
+    setPrefs: (provider: string, model: string, prefs: { label?: string | null; reasoning?: ReasoningChoice | null }) =>
+      post<{ ok: boolean } & ModelDescription>("/api/chat/models/prefs", { provider, model, ...prefs }),
+  },
+  threads: {
+    list: () => get<{ threads: ChatThread[] }>("/api/chat/threads"),
+    create: (title?: string) => post<ChatThread>("/api/chat/threads", { title }),
+    rename: (id: string, title: string) => put<{ id: string; title: string }>(`/api/chat/threads/${encodeURIComponent(id)}/title`, { title }),
+    get: (id: string) => get<ChatThread>(`/api/chat/threads/${id}`),
+    delete: (id: string) => post<{ deleted: boolean; syncPending: boolean }>(`/api/chat/threads/${id}/delete`, { confirmSessionId: id }),
+    addMessage: (id: string, role: string, content: string) =>
+      post<{ saved: boolean }>(`/api/chat/threads/${id}/messages`, {
+        role,
+        content,
+      }),
+  },
+};
+
+// ── Code Mode ──
+export const code = {
+  status: () => get<CodeStatus>("/api/code/status"),
+  set: (state: "off" | "plan" | "execute") =>
+    post<{ state: string; active: boolean }>("/api/code/set", { state }),
+};
+
+// ── Workspace ──
+export const workspace = {
+  tree: (path?: string) =>
+    get<WorkspaceTree>(`/api/workspace/tree${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+  file: (path: string) =>
+    get<WorkspaceFile>(`/api/workspace/file?path=${encodeURIComponent(path)}`),
+  saveFile: (path: string, content: string) =>
+    put<{ success: boolean; path: string }>("/api/workspace/file", { path, content }),
+  setRoot: (path: string) =>
+    put<{ success: boolean; workspace: string }>("/api/workspace/root", { path }),
+  info: () => get<WorkspaceInfo>("/api/workspace/info"),
+};
+
+// ── Git ──
+export const gitApi = {
+  status: () => get<GitStatus>("/api/git/status"),
+  branches: () => get<{ branches: GitBranch[] }>("/api/git/branches"),
+  checkout: (branch: string, create?: boolean) =>
+    post<{ success: boolean; message: string }>("/api/git/checkout", { branch, create }),
+  diff: (opts?: { staged?: boolean; file?: string }) => {
+    const qs = new URLSearchParams();
+    if (opts?.staged) qs.set("staged", "true");
+    if (opts?.file) qs.set("file", opts.file);
+    return get<{ diff: string }>(`/api/git/diff?${qs}`);
+  },
+  log: (count?: number) =>
+    get<{ commits: GitCommit[] }>(`/api/git/log${count ? `?count=${count}` : ""}`),
+  stage: (files: string[]) =>
+    post<{ success: boolean }>("/api/git/stage", { files }),
+  unstage: (files: string[]) =>
+    post<{ success: boolean }>("/api/git/unstage", { files }),
+  commit: (message: string) =>
+    post<{ success: boolean; message: string }>("/api/git/commit", { message }),
+  push: (opts?: { remote?: string; branch?: string; setUpstream?: boolean }) =>
+    post<{ success: boolean; message: string }>("/api/git/push", opts || {}),
+  pull: () => post<{ success: boolean; message: string }>("/api/git/pull", {}),
+  generateCommitMessage: () =>
+    post<{ message: string }>("/api/git/generate-commit-message", {}),
+};
+
+// ── Terminal ──
+export const terminal = {
+  exec: (command: string, cwd?: string) =>
+    post<TerminalResult>("/api/terminal/exec", { command, cwd }),
+};
+
+// ── Brain ──
+export const brain = {
+  status: () => get<BrainStatus>("/api/brain/status"),
+  memory: {
+    list: (params?: { limit?: number; offset?: number; type?: string; q?: string; scope?: string }) => {
+      const qs = new URLSearchParams();
+      if (params?.limit) qs.set("limit", String(params.limit));
+      if (params?.offset) qs.set("offset", String(params.offset));
+      if (params?.type) qs.set("type", params.type);
+      if (params?.q) qs.set("q", params.q);
+      if (params?.scope) qs.set("scope", params.scope);
+      return get<{ memories: Memory[]; total: number }>(`/api/brain/memory?${qs}`);
+    },
+    search: (q: string, limit?: number, scope?: string) =>
+      get<{ memories: Memory[]; total: number }>(
+        `/api/brain/memory/search?q=${encodeURIComponent(q)}${limit ? `&limit=${limit}` : ""}${scope ? `&scope=${scope}` : ""}`
+      ),
+    get: (id: string) => get<Memory>(`/api/brain/memory/${id}`),
+    create: (data: MemoryCreate) => post<Memory>("/api/brain/memory", data),
+    update: (id: string, data: Partial<Memory>) =>
+      put<{ success: boolean }>(`/api/brain/memory/${id}`, data),
+    delete: (id: string) => del<{ success: boolean }>(`/api/brain/memory/${id}`),
+  },
+  persons: {
+    list: (params?: { q?: string; limit?: number }) => {
+      const qs = new URLSearchParams();
+      if (params?.q) qs.set("q", params.q);
+      if (params?.limit) qs.set("limit", String(params.limit));
+      return get<{ persons: Person[]; total: number }>(`/api/brain/persons?${qs}`);
+    },
+    get: (id: string) => get<{ person: Person }>(`/api/brain/persons/${id}`),
+    memories: (id: string, limit?: number) =>
+      get<{ memories: Memory[]; total: number }>(
+        `/api/brain/persons/${id}/memories${limit ? `?limit=${limit}` : ""}`
+      ),
+  },
+  graph: () => get<GraphData>("/api/brain/graph"),
+  // Owner Model (ADR-026): what Mercury believes about the owner, with evidence.
+  beliefs: {
+    list: (params?: { status?: string; kind?: string; dimension?: string; limit?: number }) => {
+      const qs = new URLSearchParams();
+      if (params?.status) qs.set("status", params.status);
+      if (params?.kind) qs.set("kind", params.kind);
+      if (params?.dimension) qs.set("dimension", params.dimension);
+      if (params?.limit) qs.set("limit", String(params.limit));
+      return get<{ beliefs: Belief[]; total: number; counts: BeliefCounts }>(`/api/brain/beliefs?${qs}`);
+    },
+    learned: (days?: number, limit?: number) => {
+      const qs = new URLSearchParams();
+      if (days) qs.set("days", String(days));
+      if (limit) qs.set("limit", String(limit));
+      return get<{ beliefs: Belief[]; total: number; days: number }>(`/api/brain/beliefs/learned?${qs}`);
+    },
+    contested: () =>
+      get<{ pairs: Array<{ a: Belief; b: Belief | null }>; total: number }>("/api/brain/beliefs/contested"),
+    get: (id: string) => get<Belief & { evidence: BeliefEvidence[] }>(`/api/brain/beliefs/${id}`),
+    confirm: (id: string) => post<{ success: boolean; belief: Belief }>(`/api/brain/beliefs/${id}/confirm`),
+    forget: (id: string) => post<{ success: boolean; forgotten: string }>(`/api/brain/beliefs/${id}/forget`),
+    correct: (id: string, statement: string) =>
+      post<{ success: boolean; belief: Belief; replaced: Belief }>(`/api/brain/beliefs/${id}/correct`, { statement }),
+    settle: (winnerId: string, loserId: string) =>
+      post<{ success: boolean; winner: Belief; loser: Belief }>("/api/brain/beliefs/settle", { winnerId, loserId }),
+  },
+  quarantine: {
+    list: (limit?: number) =>
+      get<{ memories: Memory[]; total: number }>(`/api/brain/quarantine${limit ? `?limit=${limit}` : ""}`),
+    restore: (id: string) =>
+      post<{ success: boolean; memory: Memory | null }>(`/api/brain/quarantine/${id}/restore`),
+  },
+};
+
+// ── Agents / Tasks ──
+export const agents = {
+  list: () => get<{ agents: Agent[]; available: boolean }>("/api/agents"),
+  halt: () => post<{ ok: boolean }>("/api/agents/halt"),
+  stop: () => post<{ ok: boolean }>("/api/agents/stop"),
+};
+
+export const bgTasks = {
+  list: () => get<{ tasks: BgTask[]; available: boolean }>("/api/bg"),
+  get: (id: string) => get<BgTask>(`/api/bg/${id}`),
+  cancel: (id: string) => post<{ ok: boolean }>(`/api/bg/${id}/cancel`),
+  clear: () => post<{ ok: boolean; cleared: number }>("/api/bg/clear"),
+};
+
+// ── Skills ──
+export const skills = {
+  list: () => get<{ skills: Skill[]; total: number }>("/api/skills"),
+  install: (url: string) =>
+    post<{ success: boolean; name: string }>("/api/skills/install", { url }),
+  installFromRegistry: (id: string, force = false) =>
+    post<{
+      success: boolean;
+      id: string;
+      version: string;
+      status: "installed" | "updated" | "reinstalled" | "already-installed";
+      path: string;
+      webUrl: string;
+    }>("/api/skills/install-from-registry", { id, force }),
+  activate: (name: string) =>
+    post<{ success: boolean }>(`/api/skills/${name}/activate`),
+  deactivate: (name: string) =>
+    post<{ success: boolean }>(`/api/skills/${name}/deactivate`),
+  delete: (name: string) => del<{ success: boolean }>(`/api/skills/${name}`),
+};
+
+// ── Plugins ──
+export type PluginStatus = "available" | "installed" | "enabled" | "disabled" | "update-available" | "incompatible" | "error";
+
+export interface PluginSetting {
+  key: string;
+  type: "string" | "number" | "boolean" | "enum" | "secret";
+  description: string;
+  options?: string[];
+  value: unknown;
+  label?: string;
+  when?: Record<string, string | boolean | string[]> | Array<Record<string, string | boolean | string[]>>;
+  isSet?: boolean;
+  group?: string;
+  setup?: boolean;
+  required?: boolean;
+  optionLabels?: Record<string, string>;
+  format?: "text" | "phone";
+}
+
+export interface PluginItem {
+  id: string;
+  name: string;
+  description: string;
+  kind: "in-process" | "out-of-process";
+  tier: "official" | "community" | "local";
+  status: PluginStatus;
+  installedVersion?: string;
+  latestVersion?: string;
+  sizeBytes?: number;
+  enabled: boolean;
+  running: boolean;
+  verified: boolean;
+  tools: string[];
+  commands: string[];
+  permissions?: { network: string[]; secrets: string[] };
+  disabled?: { code: string; message: string; at: string };
+  lastError?: string;
+  incompatibleReason?: string;
+  settings?: PluginSetting[];
+  channel?: { type: string; state?: string; detail?: string; account?: string };
+  missing?: Array<{ key: string; unlocks: string; needs: string; fix: string }>;
+  settingGroups?: Array<{ id: string; label: string; description?: string; ready: boolean }>;
+}
+
+export interface PluginChannelStatus {
+  state: string;
+  detail?: string;
+  account?: string;
+  pairCode?: string;
+  qrImage?: string;
+}
+
+export const plugins = {
+  list: (refresh = false) =>
+    get<{ items: PluginItem[]; catalogError?: string; stale: boolean; safeMode: boolean }>(`/api/plugins${refresh ? "?refresh=1" : ""}`),
+  info: (id: string) => get<{ plugin: PluginItem | null }>(`/api/plugins/${encodeURIComponent(id)}`),
+  install: (source: string) =>
+    post<{ id: string; name: string; version: string; previousVersion?: string; verified: boolean; unchanged: boolean; tier: string }>("/api/plugins/install", { source }),
+  enable: (id: string) => post<{ ok: boolean }>(`/api/plugins/${encodeURIComponent(id)}/enable`),
+  disable: (id: string) => post<{ ok: boolean }>(`/api/plugins/${encodeURIComponent(id)}/disable`),
+  update: (id: string) => post<{ changed: Array<{ id: string; from: string; to: string }> }>(`/api/plugins/${encodeURIComponent(id)}/update`),
+  rollback: (id: string) => post<{ from: string; to: string }>(`/api/plugins/${encodeURIComponent(id)}/rollback`),
+  uninstall: (id: string, purge = false) => del<{ ok: boolean }>(`/api/plugins/${encodeURIComponent(id)}${purge ? "?purge=1" : ""}`),
+  setSetting: (id: string, key: string, value: unknown) =>
+    post<{ ok: boolean }>(`/api/plugins/${encodeURIComponent(id)}/settings`, { key, value }),
+  channel: (id: string) => get<{ status: PluginChannelStatus | null }>(`/api/plugins/${encodeURIComponent(id)}/channel`),
+  pair: (id: string, method: "qr" | "code", phone?: string) =>
+    post<{ status: PluginChannelStatus }>(`/api/plugins/${encodeURIComponent(id)}/pair`, { method, phone }),
+  unlink: (id: string) => post<{ ok: boolean }>(`/api/plugins/${encodeURIComponent(id)}/unlink`, {}),
+};
+
+// ── Permissions ──
+export const permissions = {
+  get: () => get<{ manifest: PermissionManifest }>("/api/permissions"),
+  update: (capabilities: Record<string, unknown>) =>
+    put<{ success: boolean; manifest: PermissionManifest }>("/api/permissions", {
+      capabilities,
+    }),
+};
+
+// ── Usage ──
+export const usage = {
+  get: () => get<UsageData>("/api/usage"),
+};
+
+// ── Schedules ──
+export const mcp = {
+  list: () => get<{ available: boolean; servers: McpServer[] }>("/api/mcp"),
+};
+
+export const schedules = {
+  list: () => get<{ schedules: Schedule[]; total: number }>("/api/schedules"),
+  update: (id: string, data: Partial<Schedule> & { resume?: boolean }) =>
+    put<{ success: boolean; schedule: Schedule }>(`/api/schedules/${id}`, data),
+  delete: (id: string) => del<{ success: boolean }>(`/api/schedules/${id}`),
+};
+
+// ── Spotify ──
+export const spotify = {
+  status: () => get<SpotifyStatus>("/api/spotify/status"),
+  nowPlaying: () => get<{ text: string }>("/api/spotify/now-playing"),
+  play: () => post<{ ok: boolean }>("/api/spotify/play"),
+  pause: () => post<{ ok: boolean }>("/api/spotify/pause"),
+  next: () => post<{ ok: boolean }>("/api/spotify/next"),
+  previous: () => post<{ ok: boolean }>("/api/spotify/previous"),
+  volume: (volume: number) =>
+    post<{ ok: boolean }>("/api/spotify/volume", { volume }),
+  shuffle: (state: boolean) =>
+    post<{ ok: boolean }>("/api/spotify/shuffle", { state }),
+  devices: () => get<{ devices: SpotifyDevice[] }>("/api/spotify/devices"),
+};
+
+// ── Kanban ──
+export const boards = {
+  list: () => get<{ boards: Board[]; available: boolean }>("/api/boards"),
+  get: (id: string) => get<{ board: Board; resources: BoardResources }>(`/api/boards/${id}`),
+  create: (data: { name: string; description?: string }) =>
+    post<{ ok: boolean; board: Board }>("/api/boards", data),
+  update: (id: string, data: Partial<Board>) =>
+    patch<{ ok: boolean; board: Board }>(`/api/boards/${id}`, data),
+  delete: (id: string) => del<{ ok: boolean }>(`/api/boards/${id}`),
+  activate: (id: string) => post<{ ok: boolean }>(`/api/boards/${id}/activate`),
+  deactivate: (id: string) =>
+    post<{ ok: boolean }>(`/api/boards/${id}/deactivate`),
+  generate: (id: string) =>
+    post<{ ok: boolean; cards: BoardCard[]; count: number }>(
+      `/api/boards/${id}/generate`
+    ),
+  executionPlan: (id: string) =>
+    get<{ ok: boolean } & ExecutionPlan>(`/api/boards/${id}/execution-plan`),
+  smartExecute: (id: string, maxSteps?: number) =>
+    post<{ ok: boolean; spawned: string[]; plan: { totalBatches: number; currentBatch: number; remainingBatches: number; nextBatchCards: string[] } }>(
+      `/api/boards/${id}/smart-execute`,
+      maxSteps ? { maxSteps } : undefined
+    ),
+  cards: {
+    add: (boardId: string, data: { task: string; priority?: string }) =>
+      post<{ ok: boolean; card: BoardCard }>(`/api/boards/${boardId}/cards`, data),
+    addBulk: (boardId: string, cards: { task: string; priority?: string }[]) =>
+      post<{ ok: boolean; cards: BoardCard[] }>(`/api/boards/${boardId}/cards/bulk`, {
+        cards,
+      }),
+    update: (boardId: string, cardId: string, data: Partial<BoardCard>) =>
+      patch<{ ok: boolean; card: BoardCard }>(
+        `/api/boards/${boardId}/cards/${cardId}`,
+        data
+      ),
+    delete: (boardId: string, cardId: string) =>
+      del<{ ok: boolean }>(`/api/boards/${boardId}/cards/${cardId}`),
+    reorder: (boardId: string, cardIds: string[]) =>
+      post<{ ok: boolean }>(`/api/boards/${boardId}/cards/reorder`, { cardIds }),
+    clearDone: (boardId: string) =>
+      post<{ ok: boolean; cleared: number }>(`/api/boards/${boardId}/cards/clear-done`),
+    run: (boardId: string, cardId: string, opts?: { maxSteps?: number; overrideBudget?: boolean; tokenBudget?: number }) =>
+      post<{ ok: boolean; agentId: string }>(
+        `/api/boards/${boardId}/cards/${cardId}/run`,
+        opts ?? undefined
+      ),
+    halt: (boardId: string, cardId: string) =>
+      post<{ ok: boolean }>(`/api/boards/${boardId}/cards/${cardId}/halt`),
+    cascade: (boardId: string, cardId: string) =>
+      post<{ ok: boolean; cascaded: string[] }>(`/api/boards/${boardId}/cards/${cardId}/cascade`),
+    // Comments
+    comments: {
+      list: (boardId: string, cardId: string) =>
+        get<{ comments: CardComment[] }>(`/api/boards/${boardId}/cards/${cardId}/comments`),
+      add: (boardId: string, cardId: string, content: string, author?: string, authorName?: string) =>
+        post<{ ok: boolean; comment: CardComment }>(`/api/boards/${boardId}/cards/${cardId}/comments`, { content, author, authorName }),
+      delete: (boardId: string, cardId: string, commentId: string) =>
+        del<{ ok: boolean }>(`/api/boards/${boardId}/cards/${cardId}/comments/${commentId}`),
+    },
+    // Attachments
+    attachments: {
+      list: (boardId: string, cardId: string) =>
+        get<{ attachments: CardAttachment[] }>(`/api/boards/${boardId}/cards/${cardId}/attachments`),
+      add: (boardId: string, cardId: string, data: { name: string; path: string; type?: string; size?: number; addedBy?: string }) =>
+        post<{ ok: boolean; attachment: CardAttachment }>(`/api/boards/${boardId}/cards/${cardId}/attachments`, data),
+      delete: (boardId: string, cardId: string, attachmentId: string) =>
+        del<{ ok: boolean }>(`/api/boards/${boardId}/cards/${cardId}/attachments/${attachmentId}`),
+      content: (boardId: string, cardId: string, attachmentId: string) =>
+        get<{ ok: boolean; attachment: CardAttachment; content: string; size: number }>(`/api/boards/${boardId}/cards/${cardId}/attachments/${attachmentId}/content`),
+      downloadUrl: (boardId: string, cardId: string, attachmentId: string) =>
+        `/api/boards/${boardId}/cards/${cardId}/attachments/${attachmentId}/download`,
+    },
+    // Labels
+    labels: {
+      add: (boardId: string, cardId: string, name: string, color: string) =>
+        post<{ ok: boolean; label: CardLabel }>(`/api/boards/${boardId}/cards/${cardId}/labels`, { name, color }),
+      remove: (boardId: string, cardId: string, labelId: string) =>
+        del<{ ok: boolean }>(`/api/boards/${boardId}/cards/${cardId}/labels/${labelId}`),
+    },
+    // Dependencies
+    setParent: (boardId: string, cardId: string, parentId: string | null) =>
+      post<{ ok: boolean }>(`/api/boards/${boardId}/cards/${cardId}/parent`, { parentId }),
+    addDependency: (boardId: string, cardId: string, dependsOnCardId: string) =>
+      post<{ ok: boolean }>(`/api/boards/${boardId}/cards/${cardId}/dependencies`, { dependsOnCardId }),
+    removeDependency: (boardId: string, cardId: string, depId: string) =>
+      del<{ ok: boolean }>(`/api/boards/${boardId}/cards/${cardId}/dependencies/${depId}`),
+  },
+  runAll: (id: string, maxSteps?: number) =>
+    post<{ ok: boolean; spawned: string[] }>(
+      `/api/boards/${id}/run-all`,
+      maxSteps ? { maxSteps } : undefined
+    ),
+  haltAll: (id: string) => post<{ ok: boolean }>(`/api/boards/${id}/halt-all`),
+  feedback: {
+    list: (boardId: string) =>
+      get<{ ok: boolean; feedback: Array<{ id: string; boardId: string; cardId: string; question: string; options?: string[]; createdAt: number }> }>(`/api/boards/${boardId}/feedback`),
+    respond: (boardId: string, feedbackId: string, response: string) =>
+      post<{ ok: boolean }>(`/api/boards/${boardId}/feedback/${feedbackId}/respond`, { response }),
+  },
+  context: {
+    get: (boardId: string) =>
+      get<{ ok: boolean; context: { workingDirectory?: string; variables: Record<string, any>; events: any[]; projectInstructions?: string; projectStructure?: Record<string, string>; knowledgeBase?: string[] } }>(`/api/boards/${boardId}/context`),
+    setDirectory: (boardId: string, directory: string) =>
+      post<{ ok: boolean }>(`/api/boards/${boardId}/context/directory`, { directory }),
+    setVariable: (boardId: string, key: string, value: any) =>
+      post<{ ok: boolean }>(`/api/boards/${boardId}/context/variables`, { key, value }),
+    setInstructions: (boardId: string, instructions: string) =>
+      post<{ ok: boolean }>(`/api/boards/${boardId}/context/instructions`, { instructions }),
+    setStructure: (boardId: string, structure: Record<string, string>) =>
+      post<{ ok: boolean }>(`/api/boards/${boardId}/context/structure`, { structure }),
+    addKnowledge: (boardId: string, knowledge: string) =>
+      post<{ ok: boolean }>(`/api/boards/${boardId}/context/knowledge`, { knowledge }),
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════
+// Type Definitions
+// ═══════════════════════════════════════════════════════════════
+
+export interface AgentStatus {
+  running: boolean;
+  state: string;
+  uptime: number;
+  providers: Record<string, { enabled: boolean; hasKey: boolean }>;
+  tokens: { dailyUsed: number; dailyBudget: number };
+  memory: { total: number; byType: Record<string, number> };
+}
+
+export interface AppConfig {
+  identity: string;
+  defaultProvider: string;
+  tokenBudget: number;
+}
+
+export interface ProviderInfo {
+  name: string;
+  recommended?: boolean;
+  maskedKey: string;
+  baseUrl: string;
+  model: string;
+  enabled: boolean;
+}
+
+export interface ProviderUpdate {
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  enabled?: boolean;
+}
+
+export interface ProviderTestResult {
+  success: boolean;
+  models?: string[];
+  recommendedModel?: string;
+}
+
+export interface ChatSettings {
+  bypassPermissions: boolean;
+  restrictUser: boolean;
+  workspace: string;
+}
+
+export interface ChatThread {
+  id: string;
+  title?: string;
+  messages: ChatMessage[];
+  createdAt: string;
+}
+
+export interface InlineChatAttachment { name: string; mime: string; data: string }
+export interface ChatAttachment { name: string; kind: 'image' | 'document'; mime?: string; url?: string }
+
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  timestamp: string;
+  steps?: ToolStep[];
+  attachments?: ChatAttachment[];
+}
+
+export interface ToolStep {
+  tool: string;
+  status: "running" | "done" | "error";
+  result?: string;
+}
+
+export type ReasoningLevel = "off" | "low" | "medium" | "high" | "xhigh" | "max";
+export type ReasoningChoice = ReasoningLevel | "auto";
+
+/** Plain-language view of a model (see src/utils/model-prefs.ts). */
+export interface ModelDescription {
+  /** Custom label if set, else the generated friendly name. */
+  label: string;
+  autoLabel: string;
+  customLabel: string | null;
+  /** Heading the model is grouped under, e.g. "ChatGPT". */
+  group: string;
+  reasoning: ReasoningChoice;
+  /** Levels this provider honours; empty means no reasoning control. */
+  reasoningLevels: ReasoningLevel[];
+}
+
+export interface ModelsResponse {
+  current: { name: string; model: string } & ModelDescription;
+  providers: ({ name: string; model: string; available: boolean; isCurrent?: boolean } & ModelDescription)[];
+}
+
+export interface CodeStatus {
+  available: boolean;
+  state: "off" | "plan" | "execute";
+  active: boolean;
+  statusText: string;
+}
+
+export interface WorkspaceTree {
+  root: string;
+  currentPath: string;
+  items: { name: string; path: string; isDirectory: boolean; type: string; size?: number; ext?: string }[];
+}
+
+export interface WorkspaceFile {
+  path: string;
+  name: string;
+  size: number;
+  truncated: boolean;
+  content: string;
+  ext: string;
+}
+
+export interface WorkspaceInfo {
+  cwd: string;
+  projectName: string;
+  projectType: string;
+  isGit: boolean;
+  branch: string;
+  remoteUrl: string;
+}
+
+export interface GitStatus {
+  branch: string;
+  upstream: string;
+  ahead: number;
+  behind: number;
+  files: GitFile[];
+  cwd: string;
+}
+
+export interface GitFile {
+  path: string;
+  status: string;
+  staged: boolean;
+}
+
+export interface GitBranch {
+  name: string;
+  isCurrent: boolean;
+  upstream: string;
+}
+
+export interface GitCommit {
+  hash: string;
+  short: string;
+  author: string;
+  email: string;
+  date: string;
+  message: string;
+}
+
+export interface TerminalResult {
+  success: boolean;
+  output: string;
+  exitCode: number;
+  cwd: string;
+  error?: string;
+}
+
+export interface BrainStatus {
+  total: number;
+  subconsciousTotal: number;
+  byType: Record<string, number>;
+  available: boolean;
+}
+
+export interface Memory {
+  id: string;
+  type: string;
+  summary: string;
+  detail?: string;
+  importance?: number;
+  confidence?: number;
+  scope?: 'active' | 'durable' | 'subconscious';
+  durability?: number;
+  evidenceKind?: string;
+  evidenceCount?: number;
+  createdAt: string;
+  updatedAt?: string;
+  lastSeenAt?: string;
+}
+
+export interface MemoryCreate {
+  type: string;
+  summary: string;
+  detail?: string;
+  confidence?: number;
+  importance?: number;
+  durability?: string;
+}
+
+export type BeliefStatus = "candidate" | "held" | "confirmed" | "contested" | "retired" | "forgotten";
+
+export interface Belief {
+  id: string;
+  kind: string;
+  dimension: string | null;
+  level: string | null;
+  statement: string;
+  detail: string | null;
+  context: string;
+  support: number;
+  against: number;
+  status: BeliefStatus;
+  ownerStated: boolean;
+  confidence: number;
+  lastSupportedAt: number;
+  createdAt: number;
+  updatedAt: number;
+  evidence?: BeliefEvidence[];
+}
+
+export interface BeliefEvidence {
+  id: string;
+  kind: string;
+  excerpt: string;
+  weight: number;
+  at: number;
+}
+
+export type BeliefCounts = Record<BeliefStatus, number>;
+
+export interface Person {
+  id: string;
+  name: string;
+  canonicalName?: string;
+  relationship?: string;
+  summary?: string;
+  traits?: string[];
+  confidence?: number;
+  memoryCount?: number;
+  firstSeenAt?: string;
+  lastSeenAt?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  connections?: Array<{ name: string; relationship: string }>;
+}
+
+export interface GraphData {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export interface GraphNode {
+  id: string;
+  label: string;
+  fullLabel?: string;
+  type: string;
+  size?: number;
+  importance?: number;
+  confidence?: number;
+  color?: string;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  type?: string;
+  weight?: number;
+}
+
+export interface Agent {
+  id: string;
+  task: string;
+  status: string;
+  tokensUsed?: number;
+  startedAt?: string;
+}
+
+export interface BgTask {
+  id: string;
+  description: string;
+  status: string;
+  output?: string;
+  createdAt: string;
+  completedAt?: string;
+}
+
+// ── Mercury Bots ──
+export interface BotStatus {
+  id: string;
+  name: string;
+  enabled: boolean;
+  state: "disabled" | "idle" | "queued" | "running" | "paused";
+  activity?: string;
+  lastRunAt?: number;
+  lastRunState?: string;
+  needsYou: boolean;
+  fleetRole?: "lead" | "crew";
+  parent?: string;
+  crewWorking?: number;
+  /** A custom face exists (`GET /api/bots/:id/avatar`); draw a monogram otherwise. */
+  hasAvatar?: boolean;
+}
+
+export interface BotManifest {
+  id: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  fleetRole?: "lead" | "crew";
+  parent?: string;
+  model?: { provider?: string; model?: string };
+  memory?: { scope: string };
+  comms?: { canMessage?: string[] };
+  schedules?: Array<{ name: string; cron: string; prompt: string }>;
+  autonomy?: { maxSteps?: number; dailyTokenBudget?: number };
+}
+
+export interface BotRunRecord {
+  runId: string;
+  botId: string;
+  trigger: string;
+  state: string;
+  startedAt: number;
+  durationMs: number;
+  tokensIn: number;
+  tokensOut: number;
+  summary?: string;
+  error?: string;
+  reasonCode?: string;
+}
+
+export interface BotDlqEntry {
+  id: string;
+  botId: string;
+  trigger: string;
+  prompt: string;
+  attempts: number;
+  reasonCode?: string;
+}
+
+export interface BotActivityEvent {
+  botId: string;
+  jobId: string;
+  kind: "turn-start" | "step" | "tool" | "turn-end";
+  label: string;
+  detail?: string;
+  stepIndex: number;
+  elapsedMs: number;
+  status?: "running" | "done" | "error";
+}
+
+export interface DeliverableInfo {
+  botId: string;
+  /** File name; stage work carries a `work/` prefix. */
+  name: string;
+  bytes: number;
+  mtimeMs: number;
+  /** Absolute path on the owner's machine. */
+  path: string;
+  /** A finished result at the top of the folder (vs. a stage under work/). */
+  final: boolean;
+}
+
+export interface DeliverablesFolder {
+  path: string;
+  display: string;
+  exists: boolean;
+}
+
+export interface BotTierInfo {
+  id: string;
+  label: string;
+  description: string;
+  deny: string[];
+}
+
+export interface BotPermissionsFile {
+  paths?: Array<{ scope: string; mode?: string; note?: string }>;
+  tools?: { allow?: string[]; deny?: string[] };
+  autoApproveCommands?: string[];
+  blockedCommands?: string[];
+  [key: string]: unknown;
+}
+
+export interface Skill {
+  name: string;
+  path: string;
+  active: boolean;
+  description?: string;
+}
+
+export interface PermissionManifest {
+  capabilities: Record<string, unknown>;
+}
+
+export interface UsageData {
+  dailyUsed: number;
+  dailyBudget: number;
+  remaining: number;
+  lastResetDate?: string;
+  requestLog: {
+    timestamp: number;
+    provider: string;
+    model?: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens: number;
+    channelType?: string;
+  }[];
+  byProvider: Record<string, number>;
+  byChannel: Record<string, number>;
+}
+
+export interface McpTool {
+  name: string;
+  exposedName: string;
+  allowed: boolean;
+  autoApprove: boolean;
+  skipped: string | null;
+}
+
+export interface McpServer {
+  id: string;
+  transport: "stdio" | "http";
+  enabled: boolean;
+  state: "disabled" | "connecting" | "connected" | "reconnecting" | "failed";
+  target: string;
+  error: string | null;
+  toolCount: number;
+  tools: McpTool[];
+}
+
+export interface Schedule {
+  id: string;
+  executeAt?: string;
+  timezone?: string;
+  missedRunPolicy?: 'skip' | 'run_once';
+  paused?: boolean;
+  lastRun?: { id: string; status: 'running' | 'completed' | 'failed' | 'interrupted' | 'skipped' | 'dispatched'; startedAt: string; finishedAt?: string; error?: string };
+  description: string;
+  cron?: string;
+  delaySeconds?: number;
+  prompt?: string;
+  skillName?: string;
+  nextRun?: string;
+}
+
+export interface SpotifyStatus {
+  available: boolean;
+  connected: boolean;
+  accountName?: string;
+}
+
+export interface SpotifyDevice {
+  id: string;
+  name: string;
+  type: string;
+  isActive: boolean;
+}
+
+export interface Board {
+  id: string;
+  name: string;
+  description?: string;
+  active: boolean;
+  cards?: BoardCard[];
+  cardCount?: number;
+  createdAt: string;
+}
+
+export interface CardComment {
+  id: string;
+  author: 'user' | 'agent';
+  authorName: string;
+  content: string;
+  timestamp: number;
+}
+
+export interface CardAttachment {
+  id: string;
+  name: string;
+  path: string;
+  type: 'markdown' | 'document' | 'image' | 'presentation' | 'other';
+  size?: number;
+  addedAt: number;
+  addedBy: 'user' | 'agent';
+}
+
+export interface CardLabel {
+  id: string;
+  name: string;
+  color: string;
+}
+
+export interface CardActivityEntry {
+  timestamp: number;
+  type: 'progress' | 'tool-use' | 'thinking' | 'completed' | 'failed' | 'feedback' | 'file-lock' | 'started';
+  message: string;
+  data?: Record<string, any>;
+}
+
+export interface BoardCard {
+  id: string;
+  task: string;
+  status: "pending" | "running" | "paused" | "done" | "failed" | "question";
+  priority?: "low" | "normal" | "medium" | "high" | "critical";
+  tokensUsed?: number;
+  tokenUsage?: { input: number; output: number; total: number } | null;
+  tokenBudget?: number | null;
+  pausedForTokens?: boolean;
+  agentId?: string;
+  error?: string;
+  result?: string;
+  progress?: string;
+  filesLocked?: string[];
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  labels?: CardLabel[];
+  comments?: CardComment[];
+  attachments?: CardAttachment[];
+  parentId?: string | null;
+  dependsOn?: string[];
+  activityLog?: CardActivityEntry[];
+}
+
+export interface ExecutionPlan {
+  batches: { wave: number; cards: BoardCard[] }[];
+  totalBatches: number;
+  totalCards: number;
+}
+
+export interface BoardResources {
+  totalTokens: number;
+  runningCount: number;
+  pendingCount: number;
+  doneCount: number;
+  failedCount: number;
+}
+
+// Default export for convenience
+const api = {
+  status,
+  health,
+  auth,
+  config,
+  providers,
+  chat,
+  code,
+  workspace,
+  git: gitApi,
+  terminal,
+  brain,
+  agents,
+  bgTasks,
+  skills,
+  plugins,
+  permissions,
+  usage,
+  schedules,
+  mcp,
+  spotify,
+  boards,
+  bots: {
+    list: () => get<{ bots: BotStatus[]; available: boolean }>("/api/bots"),
+    get: (id: string) =>
+      get<{ bot: BotManifest; state: BotStatus | null; journal: BotRunRecord[]; inbox: unknown[] }>(`/api/bots/${id}`),
+    create: (body: { id: string; name: string; description?: string }) =>
+      post<{ bot: BotManifest }>("/api/bots", body),
+    message: (id: string, message: string) =>
+      post<{ accepted: boolean; jobId?: string; reasonCode?: string }>(`/api/bots/${id}/message`, { message }),
+    patch: (id: string, body: Partial<BotManifest>) => patch<unknown>(`/api/bots/${id}`, body),
+    /** The bot's face: base64 or a `data:` URL, 2 MB at most — the core sniffs the bytes, never the name. */
+    setAvatar: (id: string, data: string) =>
+      put<{ ok: boolean; mime: string; bytes: number }>(`/api/bots/${id}/avatar`, { data }),
+    clearAvatar: (id: string) => del<{ ok: boolean; removed: boolean }>(`/api/bots/${id}/avatar`),
+    enable: (id: string) => post<{ ok: boolean }>(`/api/bots/${id}/enable`),
+    disable: (id: string) => post<{ ok: boolean }>(`/api/bots/${id}/disable`),
+    stop: (id: string) => post<{ ok: boolean }>(`/api/bots/${id}/stop`),
+    dlq: (id: string) => get<{ dlq: BotDlqEntry[] }>(`/api/bots/${id}/dlq`),
+    replay: (id: string, jobId: string) => post<{ accepted: boolean }>(`/api/bots/${id}/replay/${jobId}`),
+    storage: () =>
+      get<{ usage: Array<{ id: string; bytes: number; journalBytes: number }>; queue: { pending: number; claimed: number; dlq: number } }>("/api/bots-storage"),
+    // ── Cockpit additions ──
+    tiers: () => get<{ tiers: BotTierInfo[] }>("/api/bots/tiers"),
+    createFull: (body: { id: string; name: string; description?: string; persona?: string; tier: string; manifest?: Partial<BotManifest> }) =>
+      post<{ bot: BotManifest }>("/api/bots", body),
+    addCrewFull: (leadId: string, body: { id: string; name: string; description?: string; persona?: string; tier?: string }) =>
+      post<{ bot: BotManifest }>(`/api/bots/${leadId}/crew`, body),
+    promote: (id: string) => post<{ ok: boolean; message: string }>(`/api/bots/${id}/promote`),
+    autocrew: (id: string) => post<{ accepted: boolean; status: string }>(`/api/bots/${id}/autocrew`),
+    crew: (id: string) =>
+      get<{ lead: BotManifest; crew: BotManifest[]; maxCrew: number }>(`/api/bots/${id}/crew`),
+    persona: (id: string) => get<{ persona: string }>(`/api/bots/${id}/persona`),
+    setPersona: (id: string, persona: string) => put<{ ok: boolean }>(`/api/bots/${id}/persona`, { persona }),
+    permissions: (id: string) => get<{ permissions: BotPermissionsFile }>(`/api/bots/${id}/permissions`),
+    setPermissions: (id: string, body: { tier?: string; permissions?: BotPermissionsFile }) =>
+      put<{ permissions: BotPermissionsFile }>(`/api/bots/${id}/permissions`, body),
+    start: (id: string) => post<{ ok: boolean; resumed: number; message: string }>(`/api/bots/${id}/start`),
+    run: (id: string, routine?: string) => post<{ accepted: boolean; jobId?: string; reasonCode?: string }>(`/api/bots/${id}/run`, { routine }),
+    folder: (id?: string) => get<DeliverablesFolder>(id ? `/api/bots/${id}/folder` : "/api/bots/folder"),
+    openFolder: (id?: string) => post<{ ok: boolean; path: string }>(id ? `/api/bots/${id}/folder/open` : "/api/bots/folder/open"),
+    outputs: () => get<{ outputs: DeliverableInfo[] }>("/api/bots/outputs"),
+    botOutputs: (id: string) => get<{ outputs: DeliverableInfo[] }>(`/api/bots/${id}/outputs`),
+    outputPreview: (id: string, name: string) =>
+      get<{ preview: string; truncated: boolean }>(`/api/bots/${id}/outputs/${encodeURIComponent(name)}/preview`),
+    outputDownloadUrl: (id: string, name: string) => `/api/bots/${id}/outputs/${encodeURIComponent(name)}/download`,
+    deleteOutput: (id: string, name: string) => del<{ ok: boolean }>(`/api/bots/${id}/outputs/${encodeURIComponent(name)}`),
+    bundleUrl: (id: string) => `/api/bots/${id}/bundle`,
+    importBundle: (bundle: unknown) => post<{ report: { created: string[]; skipped: string[] } }>("/api/bots/import?overwrite=0", bundle),
+  },
+};
+
+export default api;
